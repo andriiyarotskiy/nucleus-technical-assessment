@@ -9,6 +9,14 @@ in [docs/architecture.md](docs/architecture.md).
 Requires Docker with Docker Compose:
 
 ```bash
+git clone git@github.com:andriiyarotskiy/nucleus-technical-assessment.git
+```
+
+```bash
+cd nucleus-technical-assessment
+```
+
+```bash
 docker compose up --build
 ```
 
