@@ -9,6 +9,7 @@ def test_settings_use_expected_defaults() -> None:
     assert settings.environment == "local"
     assert settings.log_level == "INFO"
     assert settings.redis_url == "redis://localhost:6379/0"
+    assert settings.worker_retry_delay_ms == 5_000
 
 
 def test_settings_read_prefixed_environment_variables(

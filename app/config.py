@@ -1,6 +1,7 @@
 from functools import lru_cache
 from typing import Literal
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,6 +19,12 @@ class Settings(BaseSettings):
     )
     redis_url: str = "redis://localhost:6379/0"
     redis_stream_name: str = "transactions"
+    redis_consumer_group: str = "transaction-processors"
+    redis_consumer_name: str | None = None
+    redis_dead_letter_stream: str = "transactions:dead-letter"
+    redis_batch_size: int = Field(default=10, ge=1, le=100)
+    redis_block_ms: int = Field(default=5_000, ge=1)
+    worker_retry_delay_ms: int = Field(default=5_000, ge=1)
 
 
 @lru_cache

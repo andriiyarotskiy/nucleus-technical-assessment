@@ -1,12 +1,7 @@
 services:
   api:
     build: .
-    environment:
-      APP_ENVIRONMENT: local
-      APP_LOG_LEVEL: INFO
-      APP_POSTGRES_DSN: postgresql+asyncpg://postgres:postgres@postgres:5432/transactions
-      APP_REDIS_URL: redis://redis:6379/0
-      APP_REDIS_STREAM_NAME: transactions
+    env_file: .env
     ports:
       - "8000:8000"
     depends_on:
@@ -18,36 +13,42 @@ services:
   migrate:
     build: .
     command: [ "alembic", "upgrade", "head" ]
-    environment:
-      APP_ENVIRONMENT: local
-      APP_LOG_LEVEL: INFO
-      APP_POSTGRES_DSN: postgresql+asyncpg://postgres:postgres@postgres:5432/transactions
-      APP_REDIS_URL: redis://redis:6379/0
-      APP_REDIS_STREAM_NAME: transactions
+    env_file: .env
     depends_on:
       postgres:
         condition: service_healthy
 
+  worker:
+    build: .
+    command: [ "python", "-m", "app.worker" ]
+    env_file: .env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
   postgres:
     image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: transactions
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_USER: postgres
+    env_file: .env
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U postgres -d transactions" ]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\"",
+        ]
       interval: 5s
       timeout: 5s
       retries: 5
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
 
   redis:
     image: redis:7.4-alpine
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     command: [ "redis-server", "--appendonly", "yes" ]
     healthcheck:
       test: [ "CMD", "redis-cli", "ping" ]

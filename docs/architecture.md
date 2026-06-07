@@ -80,9 +80,8 @@ PostgreSQL
 FastAPI read endpoints
 
 Worker failures remain in the Redis consumer group's pending entries list while
-the worker retries with capped exponential backoff. A small reclaim loop recovers
-messages abandoned by crashed workers. Non-retryable events are copied to a
-dead-letter stream.
+the worker retries after a fixed delay. `XAUTOCLAIM` recovers messages abandoned
+by crashed workers. Non-retryable events are copied to a dead-letter stream.
 ```
 
 The application will be divided into a few explicit areas rather than generic
@@ -305,12 +304,9 @@ avoided.
 - Each message is processed independently so one failure does not roll back a
   batch of unrelated messages.
 - `XACK` occurs only after a successful database transaction has committed. For
-  duplicates, that transaction contains the conflict-safe insert that confirms
-  the existing ID.
+  duplicates, the worker first confirms that the transaction ID already exists.
 - `XDEL` is not required for correctness; acknowledgement and retention are
   separate concerns.
-- A graceful shutdown stops reading new messages, finishes the active attempt,
-  and leaves unfinished messages pending for reclamation.
 
 ## Idempotency and Deduplication
 
@@ -322,10 +318,11 @@ This is chosen over an in-memory or Redis-only deduplication key because:
 - It prevents races between multiple consumers.
 - It cannot report an event as processed without the stored transaction existing.
 
-The worker uses one specific race-safe operation:
-`INSERT ... ON CONFLICT (id) DO NOTHING RETURNING id`. It does not perform a
-check-then-insert query and does not use exception-driven rollback for the normal
-duplicate path.
+The worker first checks the primary key before rate lookup so a redelivered,
+already-stored event can be acknowledged even if the rate provider is currently
+unavailable. New events still use the race-safe
+`INSERT ... ON CONFLICT (id) DO NOTHING RETURNING id`, because another consumer
+can insert the same ID between the check and insert.
 
 The first successfully stored payload wins. If a later event reuses the same ID
 with different fields, it is still treated as a duplicate and does not overwrite
@@ -350,61 +347,50 @@ deliberately omitted to keep the hot path and implementation small.
 Failed messages are not acknowledged, so they remain in the consumer group's
 pending entries list.
 
-For a retryable database or rate-provider failure, the worker keeps ownership of
-the pending entry and retries the same processing function:
+For a database, rate-provider, or unexpected processing failure, the worker does
+not acknowledge the message. The entry remains in the consumer group's pending
+entries list.
 
-1. Classify the exception as retryable.
-2. Compute exponential backoff with bounded jitter:
-   `min(base * 2^(attempt - 1), maximum) + jitter`.
-3. Use `XCLAIM` for the same consumer and entry before each sleep/attempt to
-   refresh its idle time, so a live retry is not eligible for orphan reclamation.
-4. Sleep without acknowledging the entry.
-5. Retry until processing succeeds or the process stops.
-6. On success, commit the database transaction and then `XACK`.
+Before reading another batch of new messages, the worker:
 
-Initial values:
+1. Calls `XAUTOCLAIM` with a five-second minimum idle time.
+2. Keeps the returned cursor so all pending entries are scanned over subsequent
+   iterations.
+3. Runs the same idempotent processing path for claimed entries.
+4. Calls `XACK` only after a successful commit or confirmed duplicate.
 
-- Base delay: 1 second
-- Maximum delay: 60 seconds
-- Orphan reclaim timeout: 120 seconds
-
-Transient failures are retried indefinitely with a capped delay. This directly
-satisfies "do not lose events" and avoids persistent retry metadata, a scheduler,
-and an arbitrary point at which an unavailable downstream causes valid financial
-events to be abandoned.
-
-A small reclaim loop periodically calls `XAUTOCLAIM` with the orphan reclaim
-timeout. It handles pending entries whose worker crashed or was terminated.
-Active retry loops refresh their pending-entry ownership, so normal backoff does
-not look like abandonment. A reclaimed message runs through the same idempotent
-processing path. Multiple workers may still race during failures, so the
-database primary key remains the final correctness mechanism.
+The fixed delay deliberately avoids a separate retry queue, retry table, delivery
+counter policy, and scheduler. Pending entries owned by a crashed worker are
+recovered by another worker through `XAUTOCLAIM`.
 
 Non-retryable payload failures, such as an unsupported event version or currency,
-are copied to the dead-letter stream before the original is acknowledged. The
-copy and acknowledgement use a short Redis transaction (`MULTI`/`EXEC`) so a
-crash cannot acknowledge the original without retaining the failed payload.
-Database connectivity errors, rate-provider timeouts, and other explicitly
-classified transient failures use indefinite capped backoff. Unexpected
-exceptions are retried five times and then copied to the DLQ, because an
-unclassified code or payload defect must not block a worker forever. The payload
-is retained, so this is isolation rather than loss.
+go directly to `transactions:dead-letter`. Database, rate-provider availability,
+and unexpected processing failures remain pending and continue retrying. The DLQ
+entry includes the original payload, source stream ID, and reason. The worker
+appends to the DLQ before acknowledging the original. If the append fails, the
+original remains pending.
 
-This deliberately favors correctness and simplicity over fairness: while a
-single worker waits for a downstream outage to recover, its throughput is
-reduced. Additional worker replicas can continue processing, and the stated load
-does not justify a separate delayed-retry scheduler.
+The DLQ append and original acknowledgement are intentionally two Redis commands
+to keep the implementation small. A crash between them can create a duplicate
+DLQ entry after recovery, but cannot lose the original payload. DLQ consumers
+must therefore treat `source_id` as an idempotency key.
 
 ## Delivery Guarantee
 
-The system provides **at-least-once delivery with idempotent processing**, not
-exactly-once delivery.
+The system provides **at-least-once delivery with idempotent database
+processing**, not exactly-once delivery.
 
 Exactly-once delivery across Redis and PostgreSQL would require a distributed
 transaction or a different architecture with a shared transactional boundary.
 Neither is justified here. The acknowledged trade-off is that a message can be
 processed more than once after a crash, while the database uniqueness constraint
 ensures only one transaction row is stored.
+
+An accepted message remains in the Redis stream or pending entries list until it
+is successfully processed and acknowledged, or retained in the dead-letter
+stream after the terminal policy. A crash after database commit but before
+`XACK` causes redelivery; the primary key turns that retry into a confirmed
+duplicate, which is then acknowledged.
 
 There is also a producer-side ambiguity if Redis accepts `XADD` but the HTTP
 connection fails before the response reaches the client. A client may retry;
@@ -418,12 +404,13 @@ the event ID makes this safe.
 | API crashes after `XADD` before response | Client may retry; DB deduplication makes duplicate delivery safe |
 | Worker crashes before DB commit | Message remains pending and is reclaimed |
 | Worker crashes after DB commit before `XACK` | Message is redelivered; unique ID makes processing a no-op |
-| PostgreSQL unavailable | Leave pending and retry with capped backoff |
-| Rate provider temporarily unavailable | Leave pending and retry with backoff |
-| Unsupported currency/version | Copy to DLQ and acknowledge original in one Redis transaction |
-| Unexpected processing exception | Retry five times, then retain in DLQ |
+| PostgreSQL unavailable | Leave pending and retry after the fixed delay |
+| Rate provider temporarily unavailable | Leave pending and retry after the fixed delay |
+| Unsupported currency/version | Append to DLQ, then acknowledge original |
+| Unexpected processing exception | Leave pending and retry after the fixed delay |
 | Redis restarts | AOF and named volume recover accepted stream data within Redis persistence guarantees |
-| Retry worker crashes | Due pending entries can be reclaimed by another worker |
+| Worker crashes with pending entries | Due entries are reclaimed with `XAUTOCLAIM` |
+| DLQ append fails | Original remains pending and is retried |
 | Duplicate IDs arrive concurrently | Database primary key selects one winner; the other is acknowledged as duplicate |
 | Duplicate ID has different payload | Preserve first record and do not overwrite |
 | API process restarts | Metric remains exact because it is derived from PostgreSQL |
@@ -468,7 +455,7 @@ from dependency readiness.
   - repeated ID does not create a second row
   - duplicate is considered successfully handled
   - differing payload with same ID does not overwrite the first row
-- Retry classification and backoff calculation with deterministic jitter.
+- Retry classification and pending-message recovery.
 - Acknowledgement orchestration:
   - successful commit is followed by `XACK`
   - failed commit is never followed by `XACK`
@@ -484,7 +471,6 @@ from dependency readiness.
 - Retryable dependency failure leaves a message pending.
 - Reclaimed pending message is processed safely.
 - Non-retryable event reaches the DLQ before the original is acknowledged.
-- Unexpected failures reach the DLQ after five attempts.
 - API validation, `202`, `503`, summary aggregation, filters, ordering, and
   page-based offset pagination.
 - `/metrics` returns the PostgreSQL-backed record count.
@@ -585,14 +571,14 @@ docker compose up --build
 - **Alternative:** query before insert or Redis deduplication keys.
 - **Trade-off:** duplicate attempts reach PostgreSQL and must handle conflicts.
 
-### In-place retry over a delayed-retry scheduler
+### Pending-entry retry over a separate retry queue
 
-- **Chosen:** leave transient failures pending and retry in the worker with
-  capped exponential backoff; reclaim only work abandoned by crashed consumers.
-- **Why:** directly preserves accepted events with few moving parts.
+- **Chosen:** leave failures pending and reclaim due entries with `XAUTOCLAIM`
+  after a fixed delay.
+- **Why:** retry state survives worker restarts without another queue or table.
 - **Alternatives:** retry metadata plus a scheduler, a retry stream, or broker
-  dead-letter delays.
-- **Trade-off:** a waiting worker has lower throughput during an outage.
+  delayed-delivery features.
+- **Trade-off:** all transient failures use the same delay and retry indefinitely.
 
 ### Query-time summary over a summary table
 

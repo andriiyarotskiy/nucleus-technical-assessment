@@ -2,8 +2,8 @@
 
 Python foundation for the asynchronous transaction processing service described
 in [docs/architecture.md](docs/architecture.md). The database layer, currency
-conversion service, and event ingestion endpoint are implemented; queue
-consumption is not implemented yet.
+conversion service, event ingestion endpoint, read APIs, and core Redis Streams
+worker are implemented.
 
 ## Prerequisites
 
@@ -12,6 +12,17 @@ consumption is not implemented yet.
 - Docker with Docker Compose
 
 ## Local Commands
+
+Create the local environment file before running the application:
+
+```bash
+cp .env.example .env
+```
+
+`.env.example` contains safe local defaults and is committed as a template.
+`.env` is ignored by Git and is the single source of environment values used by
+Docker Compose and `pydantic-settings`. Replace the local credentials before
+using the configuration outside local development.
 
 ```bash
 uv sync
@@ -84,8 +95,37 @@ GET /users/{user_id}/transactions?from=&to=&page=&limit=
 ```
 
 The list endpoint accepts optional timezone-aware inclusive timestamps, defaults
-to page 1 with 50 items, caps `limit` at 200, and orders by event timestamp
+to page 1 with 50 items, caps `limit` at 100, and orders by event timestamp
 descending with ID as a deterministic tie-breaker.
+
+## Worker
+
+The worker runs as `python -m app.worker` and uses the
+`transaction-processors` Redis consumer group. It checks whether the transaction
+ID is already stored before rate lookup, converts new events to USD, and performs
+a race-safe PostgreSQL `INSERT ... ON CONFLICT (id) DO NOTHING RETURNING id`.
+
+Redis messages are acknowledged only after the database transaction exits
+successfully or an existing transaction is confirmed. Temporary processing
+failures are logged and left pending.
+
+### Delivery Guarantee
+
+The worker provides **at-least-once delivery with idempotent database
+processing**:
+
+- New work is read through the `transaction-processors` consumer group.
+- Failed work is not acknowledged.
+- Due pending messages are reclaimed with `XAUTOCLAIM` after five seconds.
+- Temporary failures remain pending and are retried until they succeed.
+- Invalid payloads and unsupported currencies are appended to
+  `transactions:dead-letter` before the original is acknowledged.
+
+A crash after PostgreSQL commits but before `XACK` causes redelivery. The
+transaction ID primary key makes that retry a duplicate instead of a second
+stored row. The DLQ append and acknowledgement are separate commands: a crash
+between them can duplicate a DLQ entry, but the original payload is not lost.
+`source_id` is the DLQ idempotency key.
 
 ## Design Notes
 

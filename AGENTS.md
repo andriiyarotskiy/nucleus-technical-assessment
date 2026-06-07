@@ -1,173 +1,128 @@
 # Project Agent Guide
 
-This repository is a reusable Codex template for full-stack projects. Treat this
-file as the default contract. Prefer a more specific nested `AGENTS.md` when one
-exists in the area being changed.
+This repository is a small backend technical assessment. Follow `TASK.md` as the
+source of truth.
 
-## Working Agreement
+The solution must be easy to explain and modify during a live interview. Prefer
+less code and fewer moving parts when they still satisfy the requirements.
 
-- Read relevant code, configuration, tests, and local instructions before editing.
-- Preserve established architecture and naming unless the task requires a change.
-- Make the smallest coherent change that fully solves the problem.
-- Do not overwrite unrelated or user-authored changes.
-- Do not add dependencies, frameworks, or abstractions without a concrete need.
-- State assumptions when requirements cannot be inferred from the repository.
-- Complete implementation, tests, and verification in the same task when feasible.
+## Before Implementation
 
-## Project Discovery
+1. Read `TASK.md`, the existing code, tests, and configuration.
+2. Create or update `docs/architecture.md` with the required implementation
+   plan.
+3. For important decisions, explain the choice, reason, alternatives, and
+   accepted trade-off.
+4. Wait for approval before starting a new implementation or changing the agreed
+   architecture.
 
-Before implementation:
+For a small fix within the approved architecture, state a short plan and
+proceed.
 
-1. Inspect the repository tree and package manifests.
-2. Identify runtime versions, frameworks, entry points, and test commands.
-3. Find the nearest analogous feature and follow its conventions.
-4. Trace the complete affected path: UI, API, domain, persistence, background
-   work, and external integrations as applicable.
-5. Check for nested `AGENTS.md` files and relevant skills in `.codex/skills`.
+## Implementation Principles
 
-Never assume a project uses every technology listed below. Apply only the
-guidance relevant to the detected stack.
+Prioritize:
 
-## Architecture
+1. Simplicity.
+2. Correctness.
+3. Maintainability.
+4. Explicit error handling.
+5. Testability.
 
-- Organize code around business capabilities and clear ownership boundaries.
-- Apply DDD where domain complexity justifies it: use explicit domain language,
-  invariants, value objects, aggregates, and application services.
-- Do not force DDD layers onto simple CRUD. Complexity must pay for itself.
-- Keep domain logic independent from HTTP, UI, database, and vendor SDK details.
-- Depend on abstractions at volatile boundaries, not around stable one-line code.
-- Prefer composition over inheritance. Use inheritance only for a genuine
-  substitutable relationship.
-- Follow SOLID as a decision tool, not as a class-count target.
-- Follow DRY for knowledge and business rules. Do not unify code that merely
-  looks similar but changes for different reasons.
-- Keep modules cohesive and public interfaces small.
-- Make side effects explicit and isolate them at system boundaries.
+Rules:
 
-## Backend: Python
+- Make the smallest change that fully satisfies the task.
+- Prefer direct functions and explicit control flow.
+- Keep modules and classes focused and few.
+- Keep logic close to where it is used.
+- Add an abstraction only when it removes real duplication or is required to
+  replace or test an external dependency.
+- Do not add generic repositories, base services, factories, framework wrappers,
+  or speculative extension points.
+- Do not optimize for requirements beyond the stated load.
+- Do not refactor unrelated code or overwrite user changes.
+- Every non-obvious design choice must be explainable in plain language.
 
-- Follow the supported Python version and existing formatter, linter, and type checker.
-- Add type hints to application boundaries and non-trivial business logic.
-- Prefer explicit data flow, dependency injection, and small cohesive services.
-- Use domain-specific exceptions; translate them at transport boundaries.
-- Never expose raw database or infrastructure errors through an API.
-- Validate data at trust boundaries. Do not duplicate validation without a
-  distinct domain reason.
-- Keep sync and async call chains consistent. Never perform blocking I/O in an
-  async request path.
-- Use timezone-aware UTC datetimes internally.
-- Use `Decimal` for money and define rounding rules explicitly.
+## Required Stack
 
-### FastAPI
+Use only the stack required by the task and already present in the project:
 
-- Keep routers thin: parse input, invoke an application service, map output.
-- Express dependencies through `Depends`; avoid hidden module-level state.
-- Define request and response schemas explicitly and avoid returning ORM models.
-- Use appropriate status codes and a consistent error response shape.
-- Scope sessions to the request or unit of work.
+- Python 3.12
+- FastAPI
+- Redis Streams and consumer groups
+- PostgreSQL
+- SQLAlchemy 2.x async
+- Alembic
+- Docker Compose
+- `uv` and `pyproject.toml`
+- Ruff
+- mypy where practical
+- pytest and pytest-asyncio
 
-### Django REST Framework
+Do not add dependencies unless the task cannot be completed clearly without
+them.
 
-- Keep serializers focused on transport validation and representation.
-- Put reusable business workflows in domain or application services, not viewsets.
-- Prevent N+1 queries with deliberate `select_related` and `prefetch_related`.
-- Use transactions for multi-write invariants and `on_commit` for post-commit work.
-- Keep permissions explicit and test object-level authorization.
+## Implementation Requirements
 
-### SQLAlchemy 2.x
+- Accept and validate transaction events through FastAPI.
+- Append accepted events to Redis Streams.
+- Process events asynchronously with a consumer group.
+- Deduplicate by event `id` using a database constraint.
+- Convert money with `Decimal` and an explicit rounding rule.
+- Use timezone-aware UTC datetimes.
+- Use at-least-once delivery.
+- Acknowledge a message only after successful database persistence.
+- Preserve unacknowledged messages during temporary database or rate lookup
+  failures and retry them with backoff.
+- Handle pending messages so events abandoned by a worker can be processed
+  again.
+- Keep SQLAlchemy session and transaction boundaries explicit.
+- Expose the required read APIs and one basic metric.
+- Return clear errors without exposing raw infrastructure exceptions.
 
-- Use 2.x-style typed mappings, `select()`, and explicit session boundaries.
-- Keep transaction ownership in the application service or unit of work.
-- Avoid implicit lazy loading in serialization and async flows.
-- Use eager-loading strategies intentionally and verify query counts where relevant.
-- Do not call `commit()` inside repositories unless that is the established contract.
-
-## Frontend: React, Next.js, JavaScript, TypeScript
-
-- Prefer function components, hooks, and composition.
-- Keep server state, URL state, form state, and local UI state distinct.
-- Derive values during render when possible; do not synchronize derived state
-  with effects.
-- Use effects only for external synchronization and clean them up correctly.
-- Keep components focused. Extract logic when it becomes reusable or obscures intent.
-- Preserve accessibility: semantic HTML, labels, keyboard operation, focus
-  management, and meaningful loading and error states.
-- Validate untrusted data at runtime even when TypeScript types exist.
-- Avoid `any`; narrow `unknown` and model discriminated states explicitly.
-- In Next.js, default to server components and add `"use client"` only where
-  browser APIs, state, or interaction require it.
-- Do not expose secrets through client bundles or public environment variables.
-- Prevent request waterfalls and avoid unnecessary client-side fetching.
-
-## API And Data Contracts
-
-- Treat public APIs, events, and stored data as compatibility boundaries.
-- Prefer additive changes. Document and test intentional breaking changes.
-- Define pagination, filtering, ordering, nullability, and error semantics.
-- Make retried writes idempotent where duplicate execution is possible.
-- Validate authorization independently from whether an object exists.
-
-## Database Changes
-
-- Use the repository migration tool; never edit production schemas manually.
-- Design migrations for expected data volume and lock behavior.
-- Prefer expand/migrate/contract for incompatible or zero-downtime changes.
-- Add constraints and indexes intentionally and verify their operational cost.
-- Include rollback or forward-fix reasoning for destructive changes.
-- Never place secrets or sensitive personal data in fixtures, logs, or migrations.
-
-## Security
-
-- Apply least privilege and deny by default.
-- Enforce authentication and authorization server-side for every protected action.
-- Prevent injection with parameterized queries and framework-safe APIs.
-- Protect cookies, sessions, CORS, CSRF, redirects, uploads, and outbound URLs
-  according to the application threat model.
-- Never log credentials, tokens, secrets, or unnecessary personal data.
-- Keep secret values out of source control and client-side code.
-- Treat dependency changes as security-sensitive and review lockfile diffs.
+Keep this behavior explicit in the code. Do not hide Redis or SQLAlchemy calls
+behind generic infrastructure layers.
 
 ## Testing
 
-- Test behavior at the lowest level that gives confidence.
-- Add a regression test before or with every bug fix when practical.
-- Cover the happy path, important failure paths, authorization, and boundaries.
-- Prefer deterministic tests. Freeze time, seed randomness, and mock only external
-  boundaries or genuinely expensive dependencies.
-- Use integration tests for database mappings, transactions, framework wiring,
-  and API contracts.
-- For frontend work, prioritize user-observable behavior over implementation details.
-- Do not weaken or delete tests merely to make a change pass.
+- Add focused tests for deduplication and currency conversion.
+- Test important failure behavior such as retries and acknowledgement timing
+  where practical.
+- Prefer readable behavior tests over tests of internal implementation details.
+- Mock only external boundaries.
+- Do not weaken tests to make code pass.
 
 ## Verification
 
-Run the repository's own commands. When available, verify:
+Run the relevant project commands:
 
-1. Focused tests for the changed behavior.
-2. The broader relevant test suite.
-3. Formatting and linting.
-4. Static type checking.
-5. Build or migration validation when affected.
+```bash
+uv run pytest
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy app
+docker compose config
+```
 
-Report commands that were not run and the reason.
+Report commands that were not run and why.
 
-## Skill Selection
+## Documentation
 
-- Use `$backend-feature` for FastAPI, DRF, Python service, and API work.
-- Use `$frontend-feature` for React, Next.js, JavaScript, and TypeScript work.
-- Use `$database-change` for schema, migration, query, and persistence changes.
-- Use `$bug-fix` for reproducing and correcting defects.
-- Use `$code-review` for review-only requests.
-- Use `$security-review` for threat-focused audits and sensitive changes.
+Keep `docs/architecture.md` and `README.md` consistent with the implementation.
+Document:
 
-Use multiple skills when the task crosses boundaries, but keep one primary workflow.
+- queue choice;
+- retry and pending-message behavior;
+- acknowledgements and at-least-once delivery;
+- idempotency and deduplication;
+- one accepted trade-off;
+- what would change at 10x load;
+- local setup and verification commands.
 
 ## Definition Of Done
 
-- The requested behavior is implemented without unrelated refactoring.
-- Architecture and public contracts remain coherent.
-- Relevant tests are added or updated and pass.
-- Formatting, linting, typing, and builds pass where configured.
-- Security, performance, migrations, and compatibility were considered.
-- Documentation or examples are updated when behavior or setup changed.
-- The final report summarizes changes, verification, and residual risks.
+- All requirements from `TASK.md` are implemented.
+- The code is short, direct, and explainable line by line.
+- Failure handling does not lose accepted events.
+- Relevant tests and checks pass.
+- No unnecessary abstractions, dependencies, or unrelated changes were added.
