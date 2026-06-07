@@ -11,6 +11,7 @@ class Settings(BaseSettings):
         env_prefix="APP_",
         extra="ignore",
     )
+
     app_name: str = "Transaction Event Service"
     environment: Literal["local", "test", "production"] = "local"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"

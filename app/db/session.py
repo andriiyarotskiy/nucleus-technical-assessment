@@ -1,6 +1,3 @@
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
-
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -21,11 +18,3 @@ def build_session_factory(engine: AsyncEngine) -> AsyncSessionFactory:
         class_=AsyncSession,
         expire_on_commit=False,
     )
-
-
-@asynccontextmanager
-async def session_scope(
-    session_factory: AsyncSessionFactory,
-) -> AsyncIterator[AsyncSession]:
-    async with session_factory() as session:
-        yield session

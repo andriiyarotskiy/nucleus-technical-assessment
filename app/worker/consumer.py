@@ -1,92 +1,24 @@
 import asyncio
 import logging
-import socket
-from enum import StrEnum
-from typing import Literal, Protocol
 
 from pydantic import ValidationError
 from redis.asyncio import Redis
 from redis.exceptions import RedisError, ResponseError
-from sqlalchemy.dialects.postgresql import insert
 
-from app.config import Settings, get_settings
-from app.currency import CurrencyConverter, FixedRateProvider, UnsupportedCurrencyError
-from app.db.models import Transaction
-from app.db.session import (
-    AsyncSessionFactory,
-    build_async_engine,
-    build_session_factory,
-)
-from app.events import EventRequest
-from app.logging import configure_logging
-from app.metrics import (
+from app.schemas.events import QueuedEvent
+from app.services.currency import UnsupportedCurrencyError
+from app.services.metrics import (
     EVENTS_DUPLICATE,
     EVENTS_FAILED,
     EVENTS_PROCESSED,
     MetricsStore,
-    RedisMetricsStore,
 )
+from app.services.transactions import EventProcessor, ProcessingOutcome
 
 logger = logging.getLogger(__name__)
 
 StreamFields = dict[str, str]
 StreamMessage = tuple[str, StreamFields]
-
-
-class QueuedEvent(EventRequest):
-    version: Literal[1]
-
-
-class ProcessingOutcome(StrEnum):
-    PROCESSED = "processed"
-    DUPLICATE = "duplicate"
-
-
-class EventProcessor(Protocol):
-    async def process(self, event: QueuedEvent) -> ProcessingOutcome:
-        """Persist one event and return whether it was newly inserted."""
-
-
-class TransactionEventProcessor:
-    def __init__(
-        self,
-        session_factory: AsyncSessionFactory,
-        converter: CurrencyConverter,
-    ) -> None:
-        self._session_factory = session_factory
-        self._converter = converter
-
-    async def process(self, event: QueuedEvent) -> ProcessingOutcome:
-        async with self._session_factory() as session:
-            if await session.get(Transaction, event.id) is not None:
-                return ProcessingOutcome.DUPLICATE
-
-        conversion = await self._converter.convert_to_usd(
-            event.amount,
-            event.currency,
-        )
-        statement = (
-            insert(Transaction)
-            .values(
-                id=event.id,
-                user_id=event.user_id,
-                original_amount=event.amount,
-                original_currency=event.currency,
-                usd_rate=conversion.usd_rate,
-                amount_usd=conversion.amount_usd,
-                event_timestamp=event.timestamp,
-            )
-            .on_conflict_do_nothing(index_elements=[Transaction.id])
-            .returning(Transaction.id)
-        )
-
-        async with self._session_factory() as session:
-            async with session.begin():
-                inserted_id = (await session.execute(statement)).scalar_one_or_none()
-
-        if inserted_id is None:
-            return ProcessingOutcome.DUPLICATE
-        return ProcessingOutcome.PROCESSED
 
 
 class RedisStreamWorker:
@@ -274,39 +206,3 @@ class RedisStreamWorker:
             except RedisError:
                 logger.exception("worker_redis_unavailable")
                 await asyncio.sleep(self._retry_delay_ms / 1_000)
-
-
-async def run_worker(settings: Settings) -> None:
-    configure_logging(settings)
-    redis = Redis.from_url(settings.redis_url, decode_responses=True)
-    database_engine = build_async_engine(settings.postgres_dsn)
-    processor = TransactionEventProcessor(
-        build_session_factory(database_engine),
-        CurrencyConverter(FixedRateProvider()),
-    )
-    worker = RedisStreamWorker(
-        redis=redis,
-        processor=processor,
-        metrics=RedisMetricsStore(redis, settings.redis_metrics_key),
-        stream_name=settings.redis_stream_name,
-        group_name=settings.redis_consumer_group,
-        consumer_name=settings.redis_consumer_name or f"worker-{socket.gethostname()}",
-        dead_letter_stream=settings.redis_dead_letter_stream,
-        batch_size=settings.redis_batch_size,
-        block_ms=settings.redis_block_ms,
-        retry_delay_ms=settings.worker_retry_delay_ms,
-    )
-
-    try:
-        await worker.run_forever()
-    finally:
-        await redis.aclose()
-        await database_engine.dispose()
-
-
-def main() -> None:
-    asyncio.run(run_worker(get_settings()))
-
-
-if __name__ == "__main__":
-    main()

@@ -6,7 +6,6 @@ from app.db.session import (
     AsyncSessionFactory,
     build_async_engine,
     build_session_factory,
-    session_scope,
 )
 
 __all__ = [
@@ -15,5 +14,4 @@ __all__ = [
     "Transaction",
     "build_async_engine",
     "build_session_factory",
-    "session_scope",
 ]

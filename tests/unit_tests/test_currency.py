@@ -2,7 +2,7 @@ from decimal import Decimal
 
 import pytest
 
-from app.currency import (
+from app.services.currency import (
     CurrencyConverter,
     FixedRateProvider,
     RateProviderUnavailableError,

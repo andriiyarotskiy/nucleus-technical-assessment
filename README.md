@@ -16,6 +16,24 @@ The committed `.env.example` contains local-only defaults used by Docker
 Compose, so no setup step is required. The API is available at
 `http://localhost:8000`, with interactive docs at `http://localhost:8000/docs`.
 
+## Project Structure
+
+```text
+app/
+├── api/             FastAPI routes and dependencies
+├── core/            configuration and logging
+├── db/              SQLAlchemy models, sessions, and repositories
+├── schemas/         API and queue contracts
+├── services/        business logic and integration services
+├── worker/          Redis Streams consumer and worker entrypoint
+└── main.py          FastAPI application wiring
+```
+
+The packages follow runtime responsibilities. The transaction repository is the
+only persistence abstraction because it owns actual SQLAlchemy queries and
+transaction boundaries; services contain business decisions, while routes and
+the worker contain orchestration.
+
 ## Verification
 
 Requires Python 3.12 and [uv](https://docs.astral.sh/uv/):

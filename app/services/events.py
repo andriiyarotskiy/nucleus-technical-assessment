@@ -1,32 +1,10 @@
 import json
-from datetime import UTC, datetime
-from decimal import Decimal
-from typing import Annotated, Literal, Protocol
-from uuid import UUID
+from typing import Protocol
 
-from pydantic import AwareDatetime, BaseModel, Field, StringConstraints, field_validator
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
-CurrencyCode = Annotated[str, StringConstraints(pattern=r"^[A-Z]{3}$")]
-
-
-class EventRequest(BaseModel):
-    id: UUID
-    user_id: UUID
-    amount: Decimal = Field(gt=0, max_digits=20, decimal_places=8)
-    currency: CurrencyCode
-    timestamp: AwareDatetime
-
-    @field_validator("timestamp")
-    @classmethod
-    def normalize_timestamp(cls, value: datetime) -> datetime:
-        return value.astimezone(UTC)
-
-
-class EventAcceptedResponse(BaseModel):
-    id: UUID
-    status: Literal["accepted"] = "accepted"
+from app.schemas.events import EventRequest
 
 
 class EventPublishError(Exception):

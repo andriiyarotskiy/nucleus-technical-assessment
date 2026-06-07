@@ -2,9 +2,12 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import UUID
 
-from app.currency import ConversionResult
-from app.db.models import Transaction
-from app.worker import ProcessingOutcome, QueuedEvent, TransactionEventProcessor
+import pytest
+
+from app.db.repositories.transactions import TransactionInsert
+from app.schemas.events import QueuedEvent
+from app.services.currency import ConversionResult
+from app.services.transactions import ProcessingOutcome, TransactionEventProcessor
 
 
 def make_event() -> QueuedEvent:
@@ -18,56 +21,18 @@ def make_event() -> QueuedEvent:
     )
 
 
-class FakeSession:
-    def __init__(
-        self,
-        existing_transaction: Transaction | None = None,
-        inserted_id: UUID | None = None,
-    ) -> None:
-        self.existing_transaction = existing_transaction
-        self.inserted_id = inserted_id
-        self.get_calls = 0
-        self.execute_calls = 0
-        self.begin_calls = 0
-        self.committed = False
+class FakeTransactionStore:
+    def __init__(self, *, exists: bool, inserted: bool = True) -> None:
+        self._exists = exists
+        self._inserted = inserted
+        self.inserted_record: TransactionInsert | None = None
 
-    async def get(
-        self,
-        model: type[Transaction],
-        object_id: UUID,
-    ) -> Transaction | None:
-        self.get_calls += 1
-        return self.existing_transaction
+    async def exists(self, transaction_id: UUID) -> bool:
+        return self._exists
 
-    async def execute(self, statement: object) -> object:
-        self.execute_calls += 1
-        return FakeScalarResult(self.inserted_id)
-
-    def begin(self) -> "FakeSession":
-        self.begin_calls += 1
-        return self
-
-    async def __aenter__(self) -> "FakeSession":
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb) -> None:
-        return None
-
-
-class FakeScalarResult:
-    def __init__(self, inserted_id: UUID | None) -> None:
-        self.inserted_id = inserted_id
-
-    def scalar_one_or_none(self) -> UUID | None:
-        return self.inserted_id
-
-
-class FakeSessionFactory:
-    def __init__(self, sessions: list[FakeSession]) -> None:
-        self._sessions = sessions
-
-    def __call__(self) -> FakeSession:
-        return self._sessions.pop(0)
+    async def insert_if_absent(self, record: TransactionInsert) -> bool:
+        self.inserted_record = record
+        return self._inserted
 
 
 class FakeConverter:
@@ -79,35 +44,41 @@ class FakeConverter:
         return ConversionResult(amount_usd=Decimal("108.00"), usd_rate=Decimal("1.08"))
 
 
-async def test_dedup_short_circuits_before_conversion_and_insert() -> None:
-    existing = Transaction(
-        id=UUID("11111111-1111-1111-1111-111111111111"),
-        user_id=UUID("22222222-2222-2222-2222-222222222222"),
-        original_amount=Decimal("100.00"),
-        original_currency="EUR",
-        usd_rate=Decimal("1.0800000000"),
-        amount_usd=Decimal("108.00"),
-        event_timestamp=datetime(2026, 6, 7, 12, tzinfo=UTC),
-    )
-    session_factory = FakeSessionFactory([FakeSession(existing_transaction=existing)])
+async def test_existing_event_is_skipped_before_conversion() -> None:
+    transactions = FakeTransactionStore(exists=True)
     converter = FakeConverter()
-    processor = TransactionEventProcessor(session_factory, converter)  # type: ignore[arg-type]
+    processor = TransactionEventProcessor(
+        transactions,
+        converter,  # type: ignore[arg-type]
+    )
 
     outcome = await processor.process(make_event())
 
     assert outcome is ProcessingOutcome.DUPLICATE
     assert converter.calls == 0
+    assert transactions.inserted_record is None
 
 
-async def test_new_event_is_converted_and_inserted() -> None:
-    session = FakeSession(inserted_id=UUID("11111111-1111-1111-1111-111111111111"))
-    session_factory = FakeSessionFactory([session, session])
+@pytest.mark.parametrize(
+    ("inserted", "expected_outcome"),
+    [
+        (True, ProcessingOutcome.PROCESSED),
+        (False, ProcessingOutcome.DUPLICATE),
+    ],
+)
+async def test_database_constraint_decides_final_dedup_outcome(
+    inserted: bool,
+    expected_outcome: ProcessingOutcome,
+) -> None:
+    transactions = FakeTransactionStore(exists=False, inserted=inserted)
     converter = FakeConverter()
-    processor = TransactionEventProcessor(session_factory, converter)  # type: ignore[arg-type]
+    processor = TransactionEventProcessor(
+        transactions,
+        converter,  # type: ignore[arg-type]
+    )
 
     outcome = await processor.process(make_event())
 
-    assert outcome is ProcessingOutcome.PROCESSED
+    assert outcome is expected_outcome
     assert converter.calls == 1
-    assert session.get_calls == 1
-    assert session.execute_calls == 1
+    assert transactions.inserted_record is not None

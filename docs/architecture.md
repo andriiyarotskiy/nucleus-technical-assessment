@@ -2,8 +2,7 @@
 
 ## Status
 
-This document is the implementation plan required before coding. No implementation
-should begin until this plan is approved.
+This document describes the implemented architecture and its accepted trade-offs.
 
 ## Requirements Summary
 
@@ -17,7 +16,7 @@ The service must:
 - Survive temporary database and currency-rate failures without losing accepted
   events.
 - Expose:
-  - `POST /transactions`
+  - `POST /events`
   - `GET /users/{user_id}/summary`
   - `GET /users/{user_id}/transactions?from=&to=&page=&limit=`
   - `GET /metrics`
@@ -59,7 +58,7 @@ The service must:
 ```text
 Client
   |
-  | POST /transactions
+  | POST /events
   v
 FastAPI API process
   |
