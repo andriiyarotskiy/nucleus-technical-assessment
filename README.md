@@ -1,9 +1,9 @@
 # Transaction Event Service
 
 Python foundation for the asynchronous transaction processing service described
-in [docs/architecture.md](docs/architecture.md). The database model and migration
-are implemented; API endpoints, queue consumption, and currency conversion are
-not implemented yet.
+in [docs/architecture.md](docs/architecture.md). The database layer and currency
+conversion service are implemented; API endpoints and queue consumption are not
+implemented yet.
 
 ## Prerequisites
 
@@ -39,6 +39,13 @@ uv run alembic upgrade head --sql
 ```
 
 Docker Compose runs the migration as a one-shot service before starting the API.
+
+## Currency Conversion
+
+The in-memory provider uses fixed USD multipliers: USD `1.00`, EUR `1.08`, and
+GBP `1.27`. Conversion uses `Decimal` and rounds USD to two decimal places with
+`ROUND_HALF_UP`. The converter depends on an async rate-provider protocol so a
+future external provider can report temporary failures for worker retries.
 
 ## Run
 
