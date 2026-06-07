@@ -1,8 +1,9 @@
 # Transaction Event Service
 
-Minimal Python scaffolding for the asynchronous transaction processing service
-described in [docs/architecture.md](docs/architecture.md). Business endpoints,
-queue consumption, persistence, and currency conversion are not implemented yet.
+Python foundation for the asynchronous transaction processing service described
+in [docs/architecture.md](docs/architecture.md). The database model and migration
+are implemented; API endpoints, queue consumption, and currency conversion are
+not implemented yet.
 
 ## Prerequisites
 
@@ -20,6 +21,24 @@ uv run ruff format .
 uv run mypy app
 docker compose up --build
 ```
+
+## Database
+
+PostgreSQL stores one `transactions` table. The source event UUID is the primary
+key for durable deduplication. Decimal columns preserve money and rate precision,
+check constraints reject invalid stored values, and the composite
+`(user_id, event_timestamp DESC, id DESC)` index supports filtered transaction
+listing and per-user aggregation.
+
+Apply or inspect migrations with:
+
+```bash
+uv run alembic upgrade head
+uv run alembic downgrade base
+uv run alembic upgrade head --sql
+```
+
+Docker Compose runs the migration as a one-shot service before starting the API.
 
 ## Run
 

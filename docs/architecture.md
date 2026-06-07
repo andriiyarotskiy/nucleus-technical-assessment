@@ -208,7 +208,7 @@ PostgreSQL will contain one application table:
 | `id` | UUID | Primary key; source event ID and deduplication key |
 | `user_id` | UUID | Not null |
 | `original_amount` | NUMERIC(20, 8) | Not null, greater than zero |
-| `original_currency` | VARCHAR(3) | Not null |
+| `original_currency` | VARCHAR(3) | Not null; exactly three uppercase characters |
 | `usd_rate` | NUMERIC(20, 10) | Not null, greater than zero |
 | `amount_usd` | NUMERIC(20, 2) | Not null, greater than or equal to zero |
 | `event_timestamp` | TIMESTAMPTZ | Not null; timestamp supplied by producer |
@@ -220,6 +220,10 @@ Indexes:
 - Composite index on
   `(user_id, event_timestamp DESC, id DESC)` for filtered and consistently
   ordered transaction queries.
+
+Database check constraints enforce positive original amounts and rates,
+non-negative converted amounts, and the currency storage format. API validation
+will still provide friendlier errors before persistence.
 
 The same composite index supports the per-user summary adequately at the target
 volume. A summary table or materialized view will only be introduced if measured

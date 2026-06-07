@@ -9,9 +9,21 @@ services:
     ports:
       - "8000:8000"
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       redis:
+        condition: service_healthy
+
+  migrate:
+    build: .
+    command: [ "alembic", "upgrade", "head" ]
+    environment:
+      APP_ENVIRONMENT: local
+      APP_LOG_LEVEL: INFO
+      APP_POSTGRES_DSN: postgresql+asyncpg://postgres:postgres@postgres:5432/transactions
+      APP_REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
         condition: service_healthy
 
   postgres:
@@ -21,18 +33,20 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_USER: postgres
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d transactions"]
+      test: [ "CMD-SHELL", "pg_isready -U postgres -d transactions" ]
       interval: 5s
       timeout: 5s
       retries: 5
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
 
   redis:
     image: redis:7.4-alpine
-    command: ["redis-server", "--appendonly", "yes"]
+    command: [ "redis-server", "--appendonly", "yes" ]
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [ "CMD", "redis-cli", "ping" ]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -42,4 +56,3 @@ services:
 volumes:
   postgres_data:
   redis_data:
-
