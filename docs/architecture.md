@@ -1,647 +1,255 @@
-# Transaction Event Processing Architecture
+# Transaction Event Service Architecture
 
-## Status
+## 1. Executive Summary
 
-This document describes the implemented architecture and its accepted trade-offs.
+The service accepts transaction events, queues them in Redis Streams, converts
+amounts to USD, and stores idempotent transaction records in PostgreSQL.
 
-## Requirements Summary
+| Area | Decision |
+|---|---|
+| API | FastAPI with explicit Pydantic request and response schemas |
+| Queue | Redis Streams with one consumer group |
+| Persistence | PostgreSQL through SQLAlchemy 2.x async |
+| Delivery | At-least-once |
+| Deduplication | PostgreSQL primary key on event `id` |
+| Money | `Decimal`, rounded with `ROUND_HALF_UP` |
+| Retry | Unacknowledged pending entries reclaimed with `XAUTOCLAIM` |
+| Deployment | API, worker, PostgreSQL, Redis, and migrations in Docker Compose |
 
-The service must:
+The design targets approximately 100 events/second with short bursts near 1,000.
+It favors direct, interview-explainable control flow over framework abstractions.
 
-- Accept transaction events over HTTP:
-  `{id, user_id, amount, currency, timestamp}`.
-- Enqueue accepted events for asynchronous processing.
-- Consume events, deduplicate by transaction `id`, convert amounts to USD, and
-  persist the result.
-- Survive temporary database and currency-rate failures without losing accepted
-  events.
-- Expose:
-  - `POST /events`
-  - `GET /users/{user_id}/summary`
-  - `GET /users/{user_id}/transactions?from=&to=&page=&limit=`
-  - `GET /metrics`
-- Run locally with Docker Compose.
-- Handle approximately 100 events/second, including short bursts near 1,000
-  events/second.
-- Include unit tests for deduplication and currency conversion.
-- Use Python 3.12, `uv`, `pyproject.toml`, Ruff, mypy, pytest, and
-  pytest-asyncio.
-- Document local setup, design decisions, verification commands, and the public
-  repository URL in `README.md`.
-
-## Assumptions
-
-- Event `id` and `user_id` are UUIDs represented as strings at the API boundary.
-- `amount` is positive and supplied as a decimal string or JSON number. It is
-  converted immediately to `Decimal`; binary floating-point is not used for money.
-- `currency` is a three-letter uppercase ISO 4217 code.
-- Event timestamps are timezone-aware. They are normalized to UTC.
-- Authentication and authorization are outside this assessment's scope.
-- The producer and consumer use the same application codebase but run as separate
-  processes.
-- PostgreSQL is the durable system of record. Redis is the delivery mechanism,
-  not the source queried by read APIs.
-- Currency conversion uses an injected `CurrencyRateProvider`. The local
-  implementation uses a small configured rate table so Docker Compose works
-  without an API key or internet access. The boundary remains capable of using a
-  remote provider. The worker treats provider-unavailable errors as retryable;
-  this path is tested even though the default local provider has no network
-  dependency.
-- A configured rate is a multiplier from the source currency to USD. USD has a
-  fixed rate of `1`.
-- The conversion rate is captured when an event is successfully processed, not
-  necessarily at the event's historical timestamp. Historical rates are a
-  possible future extension.
-
-## High-Level Architecture
+## 2. Architecture Diagram
 
 ```text
-Client
-  |
-  | POST /events
-  v
-FastAPI API process
-  |
-  | XADD after validation
-  v
-Redis Stream: transactions
-  |
-  | XREADGROUP
-  v
-Worker process ----> CurrencyRateProvider
-  |
-  | SQLAlchemy async transaction
-  v
-PostgreSQL
-  ^
-  | SELECT aggregate / paginated rows
-  |
-FastAPI read endpoints
+                         GET summary / transactions
+                    +--------------------------------+
+                    |                                |
+Client --> FastAPI API --> Redis Stream --> Worker --> PostgreSQL
+           POST /events      XADD          |          transactions
+                                          |
+                                          +--> fixed USD rate provider
+                                          |
+                                          +--> Redis metrics hash
 
-Worker failures remain in the Redis consumer group's pending entries list while
-the worker retries after a fixed delay. `XAUTOCLAIM` recovers messages abandoned
-by crashed workers. Non-retryable events are copied to a dead-letter stream.
+Redis consumer group:
+  new entries     -> XREADGROUP
+  failed entries  -> pending entries list
+  recovery        -> XAUTOCLAIM
+  success         -> XACK after DB commit
+  invalid events  -> dead-letter stream, then XACK
 ```
 
-The application will be divided into a few explicit areas rather than generic
-layers:
+Package responsibilities:
 
-- HTTP schemas and thin FastAPI routes.
-- Transaction ingestion service.
-- Transaction processing service containing deduplication and conversion flow.
-- Currency conversion logic and rate-provider boundary.
-- SQLAlchemy models and focused queries.
-- Redis producer, consumer, and retry-loop code.
-- Metrics definitions.
+| Package | Responsibility |
+|---|---|
+| `app/api` | FastAPI routes and dependency wiring |
+| `app/schemas` | HTTP and queued-event contracts |
+| `app/services` | Conversion, event publishing, metrics, processing decisions |
+| `app/db` | SQLAlchemy models, sessions, repositories, migrations |
+| `app/worker` | Redis consumer loop, recovery, ACK and DLQ orchestration |
+| `app/core` | Configuration and logging |
 
-No generic repository or base-service framework is planned. SQLAlchemy queries
-will live close to the use case that owns the transaction.
+## 3. Key Decisions
 
-## API Design
-
-### `POST /events`
-
-- Validates all fields before enqueueing.
-- Returns `202 Accepted` after Redis confirms `XADD`.
-- Returns a stable response containing the event `id` and status `accepted`.
-- Returns `422` for invalid input.
-- Returns `503 Service Unavailable` if Redis cannot accept the event. A request is
-  never reported as accepted unless Redis confirms the append.
-- Accepting the same `id` more than once is allowed because final idempotency is
-  enforced by the consumer and database.
-
-### `GET /users/{user_id}/summary`
-
-- Returns `200 OK` with `user_id`, `total_usd`, and `transaction_count`.
-- Serializes `total_usd` as a decimal string so JSON conversion does not
-  introduce binary floating-point error.
-- Computes `SUM(amount_usd)` and `COUNT(*)` from persisted transactions.
-- Returns zero values when the user has no transactions.
-- A separate summary table is deliberately avoided at this load because it adds
-  transaction and consistency complexity.
-
-### `GET /users/{user_id}/transactions`
-
-- Optional `from` and `to` timestamps are inclusive and normalized to UTC.
-- Uses page-based offset pagination because it is simple to implement and explain
-  for this assessment's expected data size.
-- Default `limit` is 50; maximum is 100.
-- Results are ordered by `(event_timestamp DESC, id DESC)`.
-- Default `page` is 1.
-- Maximum `page` is 1,000,000 to reject impractical offsets before they reach
-  PostgreSQL.
-- Returns `200 OK` with `items`, `page`, `limit`, `total`, and `has_more`.
-- Each item contains `id`, `user_id`, `original_amount`,
-  `original_currency`, `usd_rate`, `amount_usd`, `event_timestamp`, and
-  `processed_at`. Money and rate fields are decimal strings.
-- Returns `422` for malformed query parameters, including negative pagination
-  values or `from > to`.
-- Returns explicit response schemas, never ORM objects.
-
-### `GET /metrics`
-
-- Exposes Prometheus text format.
-- Exposes `events_processed_total`, `events_failed_total`, and
-  `events_duplicate_total` counters.
-- Counters are stored in a Redis hash so the separate API and worker processes
-  share the same values without a metrics sidecar or external monitoring stack.
-
-All database-backed GET endpoints return `503 Service Unavailable` with a stable
-`{"detail": {"code": "...", "message": "..."}}` error shape when PostgreSQL is
-unavailable. Empty users return successful zero/empty responses rather than
-`404`, because users are not modeled as separate resources.
-
-## Data Flow
-
-1. FastAPI validates the request using a Pydantic schema.
-2. The ingestion service serializes a versioned event payload and appends it to
-   the Redis stream using `XADD`.
-3. The API returns `202` only after Redis confirms the stream entry ID.
-4. A worker reads new entries using `XREADGROUP` and a consumer group.
-5. The worker validates the queued payload again because queue data is an
-   infrastructure trust boundary.
-6. The worker resolves a USD conversion rate and calculates the USD amount using
-   `Decimal` and the documented rounding rule.
-7. Within one SQLAlchemy async transaction, the worker executes PostgreSQL
-   `INSERT ... ON CONFLICT (id) DO NOTHING RETURNING id`.
-8. A returned ID means a new row was stored. No returned ID means the event was
-   already stored and is an idempotent success.
-9. The transaction context exits successfully and commits.
-10. Only after the database transaction has committed, the worker acknowledges
-    the Redis entry with `XACK`. A duplicate is also acknowledged only after its
-    conflict-safe database transaction completes successfully.
-11. Read APIs and the basic metric query PostgreSQL and do not depend on the
-    rate provider.
-
-If the process crashes after the database commit but before `XACK`, the message
-is delivered again. The unique constraint turns that second processing attempt
-into a no-op, after which it is acknowledged.
-
-## Event Contract
-
-The Redis entry will contain a small versioned JSON payload:
-
-```json
-{
-  "version": 1,
-  "id": "transaction UUID",
-  "user_id": "user UUID",
-  "amount": "12.34",
-  "currency": "EUR",
-  "timestamp": "2026-06-06T12:00:00Z"
-}
-```
-
-Money is serialized as a string to preserve decimal precision. Versioning allows
-future additive changes and gives the consumer an explicit response to
-unsupported payload versions.
-
-## Database Schema
-
-PostgreSQL will contain one application table:
-
-### `transactions`
-
-| Column | Type | Constraints / purpose |
+| Decision | Rationale | Accepted trade-off |
 |---|---|---|
-| `id` | UUID | Primary key; source event ID and deduplication key |
-| `user_id` | UUID | Not null |
-| `original_amount` | NUMERIC(20, 8) | Not null, greater than zero |
-| `original_currency` | VARCHAR(3) | Not null; exactly three uppercase characters |
-| `usd_rate` | NUMERIC(20, 10) | Not null, greater than zero |
-| `amount_usd` | NUMERIC(20, 2) | Not null, greater than or equal to zero |
-| `event_timestamp` | TIMESTAMPTZ | Not null; timestamp supplied by producer |
-| `processed_at` | TIMESTAMPTZ | Not null; server-side processing time |
+| Redis Streams | Consumer groups, pending entries, explicit ACKs, simple Compose setup | Less durable than Kafka or a database-backed queue under catastrophic Redis loss |
+| At-least-once delivery | Redis and PostgreSQL do not share a transaction | Processing may repeat; stored rows do not |
+| DB primary key deduplication | Atomic, durable, and race-safe | Duplicate attempts still reach PostgreSQL |
+| Pre-check plus conflict-safe insert | Avoid rate lookup for known duplicates while preserving concurrency safety | Two DB operations for a new event |
+| Query-time summary | Correct and simple at the expected scale | Aggregate latency grows with user history |
+| Offset pagination | Easy API and implementation | Large offsets become slower and may shift as rows are added |
+| Fixed in-memory rates | Deterministic, offline, no API key | Rates are not current or historical |
+| Redis-backed counters | Shared by separate API and worker processes | Best-effort metrics depend on Redis |
+| Focused repository | Keeps SQLAlchemy and transaction boundaries in `db` | One concrete repository, not a generic persistence framework |
+
+## 4. Data Flow
+
+### Ingestion
+
+1. `POST /events` validates UUIDs, positive decimal amount, uppercase currency,
+   and timezone-aware timestamp.
+2. The producer writes a versioned JSON payload with `XADD`.
+3. The API returns `202 Accepted` only after Redis confirms the append.
+4. Redis failures return `503`; PostgreSQL is not touched by this endpoint.
+
+### Processing
+
+1. The worker reads new entries through `XREADGROUP`.
+2. The queued payload is validated again at the queue boundary.
+3. The processor checks whether the transaction ID already exists.
+4. New events are converted using `Decimal`.
+5. The repository executes:
+
+   ```sql
+   INSERT ... ON CONFLICT (id) DO NOTHING RETURNING id
+   ```
+
+6. Exiting `async with session.begin()` commits the transaction.
+7. The worker sends `XACK` only after the repository returns successfully.
+
+### Reads
+
+- `GET /users/{user_id}/summary` calculates `SUM(amount_usd)` and `COUNT(*)`.
+- `GET /users/{user_id}/transactions` applies optional inclusive UTC bounds,
+  offset pagination, and deterministic descending order.
+- `GET /metrics` renders Redis-backed counters in Prometheus text format.
+
+## 5. Database Design
+
+One table is sufficient for the assignment:
+
+| Column | Type | Purpose |
+|---|---|---|
+| `id` | UUID primary key | Source event ID and deduplication key |
+| `user_id` | UUID, not null | Query partition |
+| `original_amount` | NUMERIC(20, 8) | Original decimal value |
+| `original_currency` | VARCHAR(3) | Uppercase source currency |
+| `usd_rate` | NUMERIC(20, 10) | Applied conversion rate |
+| `amount_usd` | NUMERIC(20, 2) | Rounded USD result |
+| `event_timestamp` | TIMESTAMPTZ | Producer timestamp |
+| `processed_at` | TIMESTAMPTZ | Database processing timestamp |
+
+Constraints enforce positive amounts and rates, non-negative USD values, and
+currency format.
 
 Indexes:
 
-- Primary key on `id` for durable deduplication.
-- Composite index on
-  `(user_id, event_timestamp DESC, id DESC)` for filtered and consistently
-  ordered transaction queries.
+- Primary key on `id` for durable idempotency.
+- `(user_id, event_timestamp DESC, id DESC)` for filtered transaction lists and
+  per-user scans.
 
-Database check constraints enforce positive original amounts and rates,
-non-negative converted amounts, and the currency storage format. API validation
-will still provide friendlier errors before persistence.
+SQLAlchemy rules:
 
-The same composite index supports the per-user summary adequately at the target
-volume. A summary table or materialized view will only be introduced if measured
-query cost justifies it.
+- Async engine and one short-lived `AsyncSession` per repository operation.
+- Explicit `session.begin()` owns the write transaction.
+- No implicit lazy loading or ORM serialization from routes.
+- Alembic owns schema changes.
 
-`amount_usd` is rounded to two decimal places using `ROUND_HALF_UP`. The original
-amount and applied rate are retained for auditability and to make conversion
-behavior explainable.
+## 6. Queue & Delivery Guarantees
 
-Alembic will own schema creation. The initial migration is additive. Downgrade
-can drop the table because this is a new local assessment service with no
-pre-existing production data; in a real production system, a forward fix would
-usually be safer than dropping financial records.
+Redis configuration:
 
-## SQLAlchemy 2.0 Async Usage
-
-- Use SQLAlchemy 2.x typed declarative mappings.
-- Use PostgreSQL through an async driver.
-- Create one `AsyncSession` per HTTP request or worker processing attempt.
-- Use `async with session.begin()` so transaction ownership is explicit.
-- Use `select()` and SQLAlchemy 2.x execution APIs.
-- Do not return ORM models from HTTP routes.
-- Do not use implicit lazy loading.
-- Do not call `commit()` from helper query functions; the use case owns commit.
-- Handle uniqueness through the database constraint, not a check-then-insert
-  query that would race under concurrent consumers.
-
-## Queue Design
-
-### Choice
-
-Use Redis Streams with:
-
-- Stream: `transactions`
-- Consumer group: `transaction-processors`
-- One unique consumer name per worker process
-- Dead-letter stream: `transactions:dead-letter`
-
-### Why Redis Streams
-
-- Consumer groups distribute work across worker instances.
-- The pending entries list tracks delivered but unacknowledged messages.
-- Explicit acknowledgements support at-least-once processing.
-- Redis is simple to run in Docker Compose and appropriate for the stated load.
-- `XADD`, `XREADGROUP`, `XAUTOCLAIM`, and `XACK` directly
-  expose the delivery mechanics needed for the interview.
-
-### Alternatives Considered
-
-- **RabbitMQ:** stronger queue-oriented routing and dead-letter features, but adds
-  another operational model and more configuration than this service needs.
-- **Kafka:** excellent durability and partitioned throughput, but excessive for
-  100 events/second and a small locally run assessment.
-- **PostgreSQL queue table:** reduces infrastructure, but requires polling and
-  row-locking logic and does not exercise the requested Redis Streams concepts.
-- **Redis lists:** simpler enqueue/dequeue operations, but consumer groups and
-  pending-message inspection are absent.
-
-### Accepted Trade-Off
-
-Redis Streams are less durable than Kafka or a database-backed queue under a
-catastrophic Redis data loss. Docker Compose will enable Redis AOF persistence
-and use a named volume, but this is still not a cross-region durable log.
-
-The stream will have no aggressive automatic trimming in the initial version.
-Acknowledged entries may be trimmed by a maintenance policy later, only after a
-retention window. Trimming entries still present in the pending list must be
-avoided.
-
-## Consumer Groups and Acknowledgements
-
-- The worker creates the consumer group idempotently on startup using
-  `XGROUP CREATE transactions transaction-processors 0-0 MKSTREAM`. Starting at
-  `0-0`, rather than `$`, ensures events appended before worker startup are not
-  skipped.
-- New messages are read with `XREADGROUP ... >`.
-- Each message is processed independently so one failure does not roll back a
-  batch of unrelated messages.
-- `XACK` occurs only after a successful database transaction has committed. For
-  duplicates, the worker first confirms that the transaction ID already exists.
-- `XDEL` is not required for correctness; acknowledgement and retention are
-  separate concerns.
-
-## Idempotency and Deduplication
-
-The database primary key on `transactions.id` is the final idempotency mechanism.
-This is chosen over an in-memory or Redis-only deduplication key because:
-
-- It is atomic with persistence.
-- It survives application and Redis restarts.
-- It prevents races between multiple consumers.
-- It cannot report an event as processed without the stored transaction existing.
-
-The worker first checks the primary key before rate lookup so a redelivered,
-already-stored event can be acknowledged even if the rate provider is currently
-unavailable. New events still use the race-safe
-`INSERT ... ON CONFLICT (id) DO NOTHING RETURNING id`, because another consumer
-can insert the same ID between the check and insert.
-
-The first successfully stored payload wins. If a later event reuses the same ID
-with different fields, it is still treated as a duplicate and does not overwrite
-the financial record. Comparing every duplicate payload with the stored row is
-deliberately omitted to keep the hot path and implementation small.
-
-## Currency Conversion
-
-- Conversion is a pure function once `amount` and `rate` are available.
-- `Decimal` is used throughout.
-- `amount_usd = (amount * rate).quantize(Decimal("0.01"), ROUND_HALF_UP)`.
-- Unsupported currencies are non-retryable because repeating the same payload
-  cannot fix it.
-- A temporary provider timeout or unavailable provider is retryable.
-- The local configured provider is deterministic and keeps tests and Docker
-  startup independent of the internet.
-- The provider boundary is intentionally narrow: fetch one USD rate for one
-  currency. No generic integration framework is planned.
-
-## Retry Strategy
-
-Failed messages are not acknowledged, so they remain in the consumer group's
-pending entries list.
-
-For a database, rate-provider, or unexpected processing failure, the worker does
-not acknowledge the message. The entry remains in the consumer group's pending
-entries list.
-
-Before reading another batch of new messages, the worker:
-
-1. Calls `XAUTOCLAIM` with a five-second minimum idle time.
-2. Keeps the returned cursor so all pending entries are scanned over subsequent
-   iterations.
-3. Runs the same idempotent processing path for claimed entries.
-4. Calls `XACK` only after a successful commit or confirmed duplicate.
-
-The fixed delay deliberately avoids a separate retry queue, retry table, delivery
-counter policy, and scheduler. Pending entries owned by a crashed worker are
-recovered by another worker through `XAUTOCLAIM`.
-
-Non-retryable payload failures, such as an unsupported event version or currency,
-go directly to `transactions:dead-letter`. Database, rate-provider availability,
-and unexpected processing failures remain pending and continue retrying. The DLQ
-entry includes the original payload, source stream ID, and reason. The worker
-appends to the DLQ before acknowledging the original. If the append fails, the
-original remains pending.
-
-The DLQ append and original acknowledgement are intentionally two Redis commands
-to keep the implementation small. A crash between them can create a duplicate
-DLQ entry after recovery, but cannot lose the original payload. DLQ consumers
-must therefore treat `source_id` as an idempotency key.
-
-## Delivery Guarantee
-
-The system provides **at-least-once delivery with idempotent database
-processing**, not exactly-once delivery.
-
-Exactly-once delivery across Redis and PostgreSQL would require a distributed
-transaction or a different architecture with a shared transactional boundary.
-Neither is justified here. The acknowledged trade-off is that a message can be
-processed more than once after a crash, while the database uniqueness constraint
-ensures only one transaction row is stored.
-
-An accepted message remains in the Redis stream or pending entries list until it
-is successfully processed and acknowledged, or retained in the dead-letter
-stream after the terminal policy. A crash after database commit but before
-`XACK` causes redelivery; the primary key turns that retry into a confirmed
-duplicate, which is then acknowledged.
-
-There is also a producer-side ambiguity if Redis accepts `XADD` but the HTTP
-connection fails before the response reaches the client. A client may retry;
-the event ID makes this safe.
-
-## Failure Scenarios
-
-| Scenario | Behavior |
+| Item | Value |
 |---|---|
-| Redis unavailable during ingestion | Return `503`; do not claim acceptance |
-| API crashes after `XADD` before response | Client may retry; DB deduplication makes duplicate delivery safe |
-| Worker crashes before DB commit | Message remains pending and is reclaimed |
-| Worker crashes after DB commit before `XACK` | Message is redelivered; unique ID makes processing a no-op |
-| PostgreSQL unavailable | Leave pending and retry after the fixed delay |
-| Rate provider temporarily unavailable | Leave pending and retry after the fixed delay |
-| Unsupported currency/version | Append to DLQ, then acknowledge original |
-| Unexpected processing exception | Leave pending and retry after the fixed delay |
-| Redis restarts | AOF and named volume recover accepted stream data within Redis persistence guarantees |
-| Worker crashes with pending entries | Due entries are reclaimed with `XAUTOCLAIM` |
-| DLQ append fails | Original remains pending and is retried |
-| Duplicate IDs arrive concurrently | Database primary key selects one winner; the other is acknowledged as duplicate |
-| Duplicate ID has different payload | Preserve first record and do not overwrite |
-| API process restarts | Metric remains exact because it is derived from PostgreSQL |
+| Stream | `transactions` |
+| Consumer group | `transaction-processors` |
+| Dead-letter stream | `transactions:dead-letter` |
+| Persistence | AOF with a named Docker volume |
 
-## Observability
+Guarantee: **at-least-once delivery with idempotent database persistence**.
 
-The basic Prometheus-style counters are:
+- The group starts at `0-0`, so events created before worker startup are read.
+- New work uses `XREADGROUP ... >`.
+- Successful inserts are acknowledged after commit.
+- Confirmed duplicates are acknowledged as successful no-ops.
+- A crash after commit but before `XACK` causes redelivery; the primary key
+  prevents a second row.
+- Producer ambiguity after a successful `XADD` is safe because clients can retry
+  with the same event ID.
 
-- `events_processed_total`: newly inserted transactions.
-- `events_failed_total`: processing attempts rejected or failed.
-- `events_duplicate_total`: events confirmed as already stored.
+Exactly-once delivery is intentionally not claimed. It would require a shared
+transactional boundary or distributed transaction across Redis and PostgreSQL.
 
-They are kept in a Redis hash because the API and worker are separate processes.
-These are operational, best-effort counters rather than financial invariants. A
-crash between acknowledgement and counter update can undercount; PostgreSQL
-remains the source of truth for stored transactions.
+## 7. Retry Strategy
 
-Structured logs will include:
+- Retryable failures are **not acknowledged**.
+- Failed entries remain in the consumer group's pending entries list.
+- Before reading new entries, the worker calls `XAUTOCLAIM`.
+- Entries idle for five seconds are processed through the same idempotent path.
+- The claim cursor is retained so recovery can scan the pending list.
+- Redis connection failures pause the worker for the same configured delay.
 
-- Event ID
-- Redis stream entry ID
-- Consumer name
-- Attempt number
-- Outcome and stable error category
-- Processing duration
+The current policy is a fixed delay with unlimited attempts. This avoids a retry
+table, scheduler, and attempt metadata in a small assessment.
 
-Logs must not include stack traces in API responses, database credentials, or
-unnecessary full payloads. Health checks should distinguish process liveness
-from dependency readiness.
+Terminal failures:
 
-## Testing Strategy
+- Invalid payload or unsupported currency is written to the DLQ.
+- The original entry is acknowledged only after the DLQ append succeeds.
+- A crash between DLQ append and `XACK` may duplicate the DLQ entry.
+- DLQ consumers should use `source_id` as an idempotency key.
 
-### Unit Tests
+## 8. Failure Scenarios
 
-- Currency conversion:
-  - USD rate of 1
-  - non-USD multiplication
-  - `ROUND_HALF_UP` boundary behavior
-  - large decimal precision
-  - unsupported currency
-  - invalid/non-positive amounts
-- Deduplication service behavior:
-  - first event is stored
-  - repeated ID does not create a second row
-  - duplicate is considered successfully handled
-  - differing payload with same ID does not overwrite the first row
-- Retry classification and pending-message recovery.
-- Acknowledgement orchestration:
-  - successful commit is followed by `XACK`
-  - failed commit is never followed by `XACK`
-  - duplicate conflict-safe transaction is followed by `XACK`
+| Scenario | Result |
+|---|---|
+| Redis unavailable during `POST /events` | Return `503`; do not report acceptance |
+| API crashes after `XADD` | Client may retry; DB deduplication is safe |
+| Worker crashes before commit | Entry remains pending and is reclaimed |
+| Worker crashes after commit, before `XACK` | Redelivery becomes a duplicate no-op |
+| PostgreSQL unavailable | No ACK; retry from pending list |
+| Temporary rate lookup failure | No ACK; retry from pending list |
+| Unsupported currency or invalid payload | Append to DLQ, then ACK original |
+| DLQ append fails | Original remains pending |
+| Concurrent duplicate IDs | Primary key selects one stored row |
+| Duplicate ID with different data | First stored record wins; no overwrite |
+| Metrics update fails | Transaction result remains valid; metric may undercount |
+| Redis data loss | Recovery is limited to Redis AOF and volume guarantees |
 
-### Integration Tests
+## 9. Testing Strategy
 
-- PostgreSQL unique constraint under duplicate and concurrent inserts.
-- SQLAlchemy async transaction rollback and commit behavior.
-- Redis consumer-group flow: read, pending state, reclaim, and acknowledge.
-- Worker crash-equivalent case: persisted row plus unacknowledged message is
-  safely reprocessed.
-- Retryable dependency failure leaves a message pending.
-- Reclaimed pending message is processed safely.
-- Non-retryable event reaches the DLQ before the original is acknowledged.
-- API validation, `202`, `503`, summary aggregation, filters, ordering, and
-  page-based offset pagination.
-- `/metrics` returns all three counters in Prometheus text format.
+Current assignment-focused unit tests cover:
 
-Unit tests will mock only the rate-provider boundary and infrastructure failures.
-Database and Redis behavior should be covered with real disposable services
-because mocks cannot validate uniqueness, transactions, or pending-entry
-semantics.
+- `100 USD -> 100.00 USD`.
+- `100 EUR -> 108.00 USD`.
+- Unsupported currency error.
+- Retryable rate-provider failure propagation.
+- Existing event ID skips conversion and insert.
+- Database conflict determines the final duplicate outcome.
 
-## Docker Strategy
-
-Docker Compose will define:
-
-- `api`: FastAPI served by an ASGI server.
-- `worker`: the same application image with a worker command.
-- `postgres`: PostgreSQL with a health check and named volume.
-- `redis`: Redis with AOF enabled, health check, and named volume.
-
-The API and worker use the same image to avoid drift. Configuration is supplied
-through environment variables with non-secret local defaults. No credentials
-are embedded in the image.
-
-Startup behavior:
-
-- Compose health checks establish dependency readiness.
-- Alembic migrations run through an explicit one-shot migration command/service
-  before API and worker startup, avoiding multiple application instances racing
-  to migrate.
-- The worker creates the Redis consumer group idempotently.
-- Services retry dependency connection during startup with bounded delays rather
-  than relying only on Compose startup order.
-
-The image will use Python 3.12, install dependencies from the `uv` lock file, run
-as a non-root user, and use an exec-form command so shutdown signals reach the
-application.
-
-## Python Tooling
-
-- Python 3.12.
-- `uv` for dependency management and the lock file.
-- `pyproject.toml` as the single project configuration source.
-- Ruff for formatting, linting, and import ordering.
-- mypy for practical static checking of `app`.
-- pytest and pytest-asyncio for tests.
-
-No Poetry, pip-tools, Black, Flake8, or separate isort configuration will be
-introduced.
-
-## README Plan
-
-`README.md` will include:
-
-- A short architecture overview and request-to-worker data flow.
-- Prerequisites and local startup with `docker compose up --build`.
-- Example requests for ingestion, summary, paginated transactions, and metrics.
-- Why Redis Streams was chosen.
-- The at-least-once delivery and idempotency explanation.
-- One explicit accepted trade-off: Redis durability is weaker than a durable
-  replicated log, accepted for local simplicity.
-- What would change at 10x load.
-- How database and rate-provider failures are retried.
-- Required local commands:
+Verification commands:
 
 ```bash
-uv sync
 uv run pytest
 uv run ruff check .
-uv run ruff format .
+uv run ruff format --check .
 uv run mypy app
-docker compose up --build
+docker compose config
 ```
 
-- The public GitHub or GitLab repository URL before submission.
+Deliberate gap: real Redis pending-entry recovery and PostgreSQL concurrency are
+not integration-tested in this take-home. Production confidence would require
+disposable Redis/PostgreSQL integration tests for ACK timing, rollback,
+`XAUTOCLAIM`, and concurrent inserts.
 
-## Important Technical Decisions
+## 10. Trade-Offs
 
-### Redis Streams over a dedicated broker
+### Simplicity accepted
 
-- **Chosen:** Redis Streams and consumer groups.
-- **Why:** sufficient throughput, simple local operation, explicit pending and
-  acknowledgement semantics.
-- **Alternatives:** RabbitMQ, Kafka, PostgreSQL queue.
-- **Trade-off:** weaker catastrophic-loss guarantees and more manual retry/DLQ
-  handling than specialized brokers.
+- Fixed rates instead of an external rate API.
+- Fixed-delay, unlimited retries instead of exponential backoff and max attempts.
+- Offset pagination instead of cursor pagination.
+- Query-time summaries instead of a maintained summary table.
+- Best-effort Redis counters instead of a dedicated metrics stack.
+- Non-atomic DLQ append plus ACK instead of a Redis transaction or Lua script.
 
-### At-least-once over exactly-once
+### Intentionally excluded
 
-- **Chosen:** acknowledge after commit and make processing idempotent.
-- **Why:** Redis and PostgreSQL do not share a transaction.
-- **Alternative:** distributed transactions or a single database-backed queue.
-- **Trade-off:** duplicate execution is possible, but duplicate stored records
-  are prevented.
+- Authentication and authorization.
+- Historical exchange-rate semantics.
+- Automated DLQ replay.
+- Aggressive stream trimming.
+- Generic repositories, base services, or dependency-injection frameworks.
 
-### Database constraint over pre-check deduplication
+These choices keep the implementation small enough to explain and modify during
+an interview while preserving the core reliability requirements.
 
-- **Chosen:** primary key on source event ID.
-- **Why:** atomic, durable, and race-safe.
-- **Alternative:** query before insert or Redis deduplication keys.
-- **Trade-off:** duplicate attempts reach PostgreSQL and must handle conflicts.
+## 11. 10x Scaling Plan
 
-### Pending-entry retry over a separate retry queue
+If sustained throughput grows toward 1,000 events/second:
 
-- **Chosen:** leave failures pending and reclaim due entries with `XAUTOCLAIM`
-  after a fixed delay.
-- **Why:** retry state survives worker restarts without another queue or table.
-- **Alternatives:** retry metadata plus a scheduler, a retry stream, or broker
-  delayed-delivery features.
-- **Trade-off:** all transient failures use the same delay and retry indefinitely.
-
-### Query-time summary over a summary table
-
-- **Chosen:** `SUM` and `COUNT` on stored transactions.
-- **Why:** simplest correct design at the expected load.
-- **Alternatives:** transactional summary row, materialized view, analytics store.
-- **Trade-off:** summary latency grows with each user's transaction count.
-
-### Page-based offset over keyset pagination
-
-- **Chosen:** page and limit translated to `LIMIT/OFFSET`, with deterministic
-  timestamp and ID ordering.
-- **Why:** smallest API and implementation for an assessment-sized data set.
-- **Alternative:** keyset cursor pagination.
-- **Trade-off:** large offsets become slower and can shift while new rows arrive.
-
-### Configured local rates behind a provider boundary
-
-- **Chosen:** deterministic offline local provider with an injectable interface.
-- **Why:** Compose works without an API key or external network and conversion is
-  easy to test.
-- **Alternatives:** live public rate API or a separate mock-rate container.
-- **Trade-off:** local rates are not real-time; a production deployment would
-  replace the provider and define rate freshness/historical semantics.
-
-### Redis counters over process-local counters
-
-- **Chosen:** keep three counters in a Redis hash and render them from the API.
-- **Why:** API and worker processes share values using infrastructure already in
-  the service.
-- **Alternatives:** process-local counters, Prometheus multiprocess mode, or a
-  separate worker metrics server.
-- **Trade-off:** counters are best-effort operational signals and depend on
-  Redis availability.
-
-## What Would Change at 10x Load
-
-At sustained 1,000 events/second, with larger bursts:
-
-- Run multiple worker replicas with distinct consumer names and tune batch size
-  and database connection pools based on measurements.
-- Partition work if one Redis stream or consumer group becomes a bottleneck,
-  likely by a stable hash of `user_id`.
-- Cache remote currency rates with explicit freshness and stale-rate policy to
-  avoid one lookup per event.
-- Use PostgreSQL bulk inserts where compatible with per-message error handling.
-- Consider a transactional per-user summary table if aggregate-query latency is
-  measured to be unacceptable. Updates would occur in the same transaction as
-  the insert and only when the insert is new.
-- Add stream retention based on age and acknowledged state, plus automated DLQ
-  replay tooling.
-- Export metrics to Prometheus/Grafana and alert on pending count, oldest pending
-  age, retry rate, DLQ growth, and database pool saturation.
-- Inspect query plans and consider table partitioning by event time only after
-  table size demonstrates a need.
-- Reassess Redis durability. If event loss tolerance approaches zero or replay
-  volume becomes important, move to a replicated durable broker such as Kafka.
-- Add load tests that cover burst ingestion, consumer recovery, and downstream
-  outage recovery rather than optimizing from assumptions.
-
-## Approval Gate
-
-Implementation should begin only after this architecture is reviewed and
-approved. The first implementation slice should establish Docker Compose,
-configuration, migrations, and the minimal ingest-to-worker-to-database path
-before adding read APIs, retries, metrics, and broader tests.
+1. Add worker replicas with unique consumer names.
+2. Tune Redis batch size and PostgreSQL connection pools using load tests.
+3. Cache external exchange rates with explicit freshness rules.
+4. Replace offset pagination with keyset pagination for deep lists.
+5. Add a transactional per-user summary table only if query measurements justify
+   it.
+6. Partition streams by stable `user_id` hash if one stream becomes a bottleneck.
+7. Add retention policies, DLQ replay tools, and alerts for pending age and DLQ
+   growth.
+8. Add real Redis/PostgreSQL integration and outage-recovery tests.
+9. Reassess Redis durability; move to a replicated durable broker if event-loss
+   tolerance or replay requirements demand it.
