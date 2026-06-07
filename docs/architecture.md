@@ -19,7 +19,7 @@ The service must:
 - Expose:
   - `POST /transactions`
   - `GET /users/{user_id}/summary`
-  - `GET /users/{user_id}/transactions?from=&to=&limit=&offset=`
+  - `GET /users/{user_id}/transactions?from=&to=&page=&limit=`
   - `GET /metrics`
 - Run locally with Docker Compose.
 - Handle approximately 100 events/second, including short bursts near 1,000
@@ -125,12 +125,14 @@ will live close to the use case that owns the transaction.
 ### `GET /users/{user_id}/transactions`
 
 - Optional `from` and `to` timestamps are inclusive and normalized to UTC.
-- Uses offset pagination because it is simpler to implement and explain for this
-  assessment's expected data size.
-- Default `limit` is 50; maximum is 200.
+- Uses page-based offset pagination because it is simple to implement and explain
+  for this assessment's expected data size.
+- Default `limit` is 50; maximum is 100.
 - Results are ordered by `(event_timestamp DESC, id DESC)`.
-- Default `offset` is 0.
-- Returns `200 OK` with `items`, `limit`, `offset`, and `has_more`.
+- Default `page` is 1.
+- Maximum `page` is 1,000,000 to reject impractical offsets before they reach
+  PostgreSQL.
+- Returns `200 OK` with `items`, `page`, `limit`, `total`, and `has_more`.
 - Each item contains `id`, `user_id`, `original_amount`,
   `original_currency`, `usd_rate`, `amount_usd`, `event_timestamp`, and
   `processed_at`. Money and rate fields are decimal strings.
@@ -483,8 +485,8 @@ from dependency readiness.
 - Reclaimed pending message is processed safely.
 - Non-retryable event reaches the DLQ before the original is acknowledged.
 - Unexpected failures reach the DLQ after five attempts.
-- API validation, `202`, `503`, summary aggregation, filters, ordering, and offset
-  pagination.
+- API validation, `202`, `503`, summary aggregation, filters, ordering, and
+  page-based offset pagination.
 - `/metrics` returns the PostgreSQL-backed record count.
 
 Unit tests will mock only the rate-provider boundary and infrastructure failures.
@@ -599,9 +601,10 @@ docker compose up --build
 - **Alternatives:** transactional summary row, materialized view, analytics store.
 - **Trade-off:** summary latency grows with each user's transaction count.
 
-### Offset over keyset pagination
+### Page-based offset over keyset pagination
 
-- **Chosen:** `LIMIT/OFFSET` with deterministic timestamp and ID ordering.
+- **Chosen:** page and limit translated to `LIMIT/OFFSET`, with deterministic
+  timestamp and ID ordering.
 - **Why:** smallest API and implementation for an assessment-sized data set.
 - **Alternative:** keyset cursor pagination.
 - **Trade-off:** large offsets become slower and can shift while new rows arrive.

@@ -74,6 +74,19 @@ docker compose up --build
 
 The API container listens on `http://localhost:8000`.
 
+## Read APIs
+
+Stored transactions are available through:
+
+```text
+GET /users/{user_id}/summary
+GET /users/{user_id}/transactions?from=&to=&page=&limit=
+```
+
+The list endpoint accepts optional timezone-aware inclusive timestamps, defaults
+to page 1 with 50 items, caps `limit` at 200, and orders by event timestamp
+descending with ID as a deterministic tie-breaker.
+
 ## Design Notes
 
 The following sections will be completed as their implementation slices are
