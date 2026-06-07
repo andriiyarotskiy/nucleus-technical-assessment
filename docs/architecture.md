@@ -142,11 +142,10 @@ will live close to the use case that owns the transaction.
 ### `GET /metrics`
 
 - Exposes Prometheus text format.
-- Exposes the required basic metric as a PostgreSQL-backed
-  `transaction_records` gauge.
-- The API executes `COUNT(*)` against the source-of-truth table when metrics are
-  scraped. This is exact, works across separate API and worker containers, and
-  avoids adding a second persisted counter for the take-home.
+- Exposes `events_processed_total`, `events_failed_total`, and
+  `events_duplicate_total` counters.
+- Counters are stored in a Redis hash so the separate API and worker processes
+  share the same values without a metrics sidecar or external monitoring stack.
 
 All database-backed GET endpoints return `503 Service Unavailable` with a stable
 `{"detail": {"code": "...", "message": "..."}}` error shape when PostgreSQL is
@@ -417,14 +416,16 @@ the event ID makes this safe.
 
 ## Observability
 
-The required metric is:
+The basic Prometheus-style counters are:
 
-- `transaction_records`: a Prometheus gauge set from `SELECT COUNT(*) FROM
-  transactions`.
+- `events_processed_total`: newly inserted transactions.
+- `events_failed_total`: processing attempts rejected or failed.
+- `events_duplicate_total`: events confirmed as already stored.
 
-PostgreSQL is already the source of truth, so this metric is exact across process
-restarts and duplicate deliveries. Additional counters and histograms are
-deferred to keep the take-home implementation small.
+They are kept in a Redis hash because the API and worker are separate processes.
+These are operational, best-effort counters rather than financial invariants. A
+crash between acknowledgement and counter update can undercount; PostgreSQL
+remains the source of truth for stored transactions.
 
 Structured logs will include:
 
@@ -473,7 +474,7 @@ from dependency readiness.
 - Non-retryable event reaches the DLQ before the original is acknowledged.
 - API validation, `202`, `503`, summary aggregation, filters, ordering, and
   page-based offset pagination.
-- `/metrics` returns the PostgreSQL-backed record count.
+- `/metrics` returns all three counters in Prometheus text format.
 
 Unit tests will mock only the rate-provider boundary and infrastructure failures.
 Database and Redis behavior should be covered with real disposable services
@@ -604,13 +605,15 @@ docker compose up --build
 - **Trade-off:** local rates are not real-time; a production deployment would
   replace the provider and define rate freshness/historical semantics.
 
-### Database-backed gauge over process-local counters
+### Redis counters over process-local counters
 
-- **Chosen:** expose the current stored transaction count from PostgreSQL.
-- **Why:** exact across API and worker processes and trivial to explain.
-- **Alternatives:** Prometheus multiprocess mode, a Redis counter, or a separate
-  worker metrics server.
-- **Trade-off:** each scrape performs a simple `COUNT(*)` query.
+- **Chosen:** keep three counters in a Redis hash and render them from the API.
+- **Why:** API and worker processes share values using infrastructure already in
+  the service.
+- **Alternatives:** process-local counters, Prometheus multiprocess mode, or a
+  separate worker metrics server.
+- **Trade-off:** counters are best-effort operational signals and depend on
+  Redis availability.
 
 ## What Would Change at 10x Load
 

@@ -19,6 +19,13 @@ from app.db.session import (
 )
 from app.events import EventRequest
 from app.logging import configure_logging
+from app.metrics import (
+    EVENTS_DUPLICATE,
+    EVENTS_FAILED,
+    EVENTS_PROCESSED,
+    MetricsStore,
+    RedisMetricsStore,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +94,7 @@ class RedisStreamWorker:
         self,
         redis: Redis,
         processor: EventProcessor,
+        metrics: MetricsStore,
         stream_name: str,
         group_name: str,
         consumer_name: str,
@@ -97,6 +105,7 @@ class RedisStreamWorker:
     ) -> None:
         self._redis = redis
         self._processor = processor
+        self._metrics = metrics
         self._stream_name = stream_name
         self._group_name = group_name
         self._consumer_name = consumer_name
@@ -126,6 +135,7 @@ class RedisStreamWorker:
     async def process_entry(self, stream_id: str, fields: StreamFields) -> None:
         payload = fields.get("data")
         if payload is None:
+            await self._record_metric(EVENTS_FAILED)
             await self._dead_letter(stream_id, "", "invalid_payload")
             return
 
@@ -134,14 +144,17 @@ class RedisStreamWorker:
             outcome = await self._processor.process(event)
         except ValidationError:
             logger.exception("transaction_payload_invalid stream_id=%s", stream_id)
+            await self._record_metric(EVENTS_FAILED)
             await self._dead_letter(stream_id, payload, "invalid_payload")
             return
         except UnsupportedCurrencyError:
             logger.exception("transaction_currency_unsupported stream_id=%s", stream_id)
+            await self._record_metric(EVENTS_FAILED)
             await self._dead_letter(stream_id, payload, "unsupported_currency")
             return
         except Exception:
             logger.exception("transaction_processing_failed stream_id=%s", stream_id)
+            await self._record_metric(EVENTS_FAILED)
             return
 
         try:
@@ -155,12 +168,24 @@ class RedisStreamWorker:
             )
             return
 
+        metric_name = (
+            EVENTS_PROCESSED
+            if outcome is ProcessingOutcome.PROCESSED
+            else EVENTS_DUPLICATE
+        )
+        await self._record_metric(metric_name)
         logger.info(
             "transaction_%s event_id=%s stream_id=%s",
             outcome,
             event.id,
             stream_id,
         )
+
+    async def _record_metric(self, metric_name: str) -> None:
+        try:
+            await self._metrics.increment(metric_name)
+        except RedisError:
+            logger.exception("metric_increment_failed metric=%s", metric_name)
 
     async def _dead_letter(
         self,
@@ -262,6 +287,7 @@ async def run_worker(settings: Settings) -> None:
     worker = RedisStreamWorker(
         redis=redis,
         processor=processor,
+        metrics=RedisMetricsStore(redis, settings.redis_metrics_key),
         stream_name=settings.redis_stream_name,
         group_name=settings.redis_consumer_group,
         consumer_name=settings.redis_consumer_name or f"worker-{socket.gethostname()}",

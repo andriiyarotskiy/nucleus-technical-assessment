@@ -127,6 +127,21 @@ stored row. The DLQ append and acknowledgement are separate commands: a crash
 between them can duplicate a DLQ entry, but the original payload is not lost.
 `source_id` is the DLQ idempotency key.
 
+## Metrics
+
+`GET /metrics` returns Prometheus-style text without requiring a Prometheus
+server:
+
+```text
+events_processed_total 0
+events_failed_total 0
+events_duplicate_total 0
+```
+
+The worker stores these shared counters in Redis so the API can expose values
+from the separate worker process. They are operational, best-effort metrics;
+PostgreSQL remains the source of truth for transaction data.
+
 ## Design Notes
 
 The following sections will be completed as their implementation slices are

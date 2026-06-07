@@ -17,6 +17,7 @@ from app.currency import (
     UnsupportedCurrencyError,
 )
 from app.db.models import Transaction
+from app.metrics import EVENTS_DUPLICATE, EVENTS_FAILED, EVENTS_PROCESSED
 from app.worker import (
     ProcessingOutcome,
     QueuedEvent,
@@ -147,13 +148,26 @@ class UnsupportedCurrencyProcessor:
         raise UnsupportedCurrencyError(event.currency)
 
 
+class RecordingMetrics:
+    def __init__(self) -> None:
+        self.increments: list[str] = []
+
+    async def increment(self, metric_name: str) -> None:
+        self.increments.append(metric_name)
+
+    async def snapshot(self) -> object:
+        raise NotImplementedError
+
+
 def make_worker(
     redis: RecordingRedis,
     processor: RecordingProcessor | FailingProcessor | UnsupportedCurrencyProcessor,
+    metrics: RecordingMetrics | None = None,
 ) -> RedisStreamWorker:
     return RedisStreamWorker(
         redis=redis,  # type: ignore[arg-type]
         processor=processor,
+        metrics=metrics or RecordingMetrics(),  # type: ignore[arg-type]
         stream_name="transactions",
         group_name="transaction-processors",
         consumer_name="worker-1",
@@ -174,7 +188,12 @@ async def test_worker_acknowledges_only_after_successful_processing(
 ) -> None:
     operations: list[str] = []
     redis = RecordingRedis(operations)
-    worker = make_worker(redis, RecordingProcessor(operations, outcome))
+    metrics = RecordingMetrics()
+    worker = make_worker(
+        redis,
+        RecordingProcessor(operations, outcome),
+        metrics,
+    )
 
     with caplog.at_level(logging.INFO, logger="app.worker"):
         await worker.process_entry("1-0", stream_fields())
@@ -182,13 +201,17 @@ async def test_worker_acknowledges_only_after_successful_processing(
     assert operations == ["commit", "ack"]
     assert redis.acknowledged_ids == ["1-0"]
     assert f"transaction_{outcome}" in caplog.text
+    assert metrics.increments == [
+        EVENTS_PROCESSED if outcome is ProcessingOutcome.PROCESSED else EVENTS_DUPLICATE
+    ]
 
 
 async def test_worker_leaves_transient_failure_pending(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     redis = RecordingRedis([])
-    worker = make_worker(redis, FailingProcessor())
+    metrics = RecordingMetrics()
+    worker = make_worker(redis, FailingProcessor(), metrics)
 
     with caplog.at_level(logging.ERROR, logger="app.worker"):
         await worker.process_entry("1-0", stream_fields())
@@ -196,6 +219,7 @@ async def test_worker_leaves_transient_failure_pending(
     assert redis.acknowledged_ids == []
     assert redis.dead_letter_entries == []
     assert "transaction_processing_failed" in caplog.text
+    assert metrics.increments == [EVENTS_FAILED]
 
 
 @pytest.mark.parametrize(
@@ -211,17 +235,19 @@ async def test_worker_dead_letters_permanent_failures(
 ) -> None:
     operations: list[str] = []
     redis = RecordingRedis(operations)
+    metrics = RecordingMetrics()
     processor = (
         UnsupportedCurrencyProcessor()
         if reason == "unsupported_currency"
         else RecordingProcessor(operations, ProcessingOutcome.PROCESSED)
     )
-    worker = make_worker(redis, processor)
+    worker = make_worker(redis, processor, metrics)
 
     await worker.process_entry("1-0", fields)
 
     assert operations == ["dead_letter", "ack"]
     assert redis.dead_letter_entries[0][1]["reason"] == reason
+    assert metrics.increments == [EVENTS_FAILED]
 
 
 async def test_dead_letter_failure_leaves_original_pending() -> None:

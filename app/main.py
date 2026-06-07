@@ -9,6 +9,7 @@ from app.config import get_settings
 from app.db.session import build_async_engine, build_session_factory
 from app.events import RedisStreamEventProducer
 from app.logging import configure_logging
+from app.metrics import RedisMetricsStore
 
 
 @asynccontextmanager
@@ -19,6 +20,10 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     application.state.event_producer = RedisStreamEventProducer(
         redis,
         settings.redis_stream_name,
+    )
+    application.state.metrics_store = RedisMetricsStore(
+        redis,
+        settings.redis_metrics_key,
     )
     application.state.session_factory = build_session_factory(database_engine)
     yield

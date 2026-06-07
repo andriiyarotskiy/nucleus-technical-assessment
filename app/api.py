@@ -3,8 +3,9 @@ from datetime import UTC
 from typing import Annotated, cast
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from pydantic import AwareDatetime, BaseModel
+from redis.exceptions import RedisError
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -15,6 +16,7 @@ from app.events import (
     EventPublishError,
     EventRequest,
 )
+from app.metrics import MetricsStore, render_prometheus
 from app.transactions import (
     SQLAlchemyTransactionReader,
     TransactionPageResponse,
@@ -40,6 +42,10 @@ class ErrorResponse(BaseModel):
 
 def get_event_producer(request: Request) -> EventProducer:
     return cast(EventProducer, request.app.state.event_producer)
+
+
+def get_metrics_store(request: Request) -> MetricsStore:
+    return cast(MetricsStore, request.app.state.metrics_store)
 
 
 async def get_db_session(request: Request) -> AsyncIterator[AsyncSession]:
@@ -91,6 +97,36 @@ async def publish_event(
         ) from error
 
     return EventAcceptedResponse(id=event.id)
+
+
+@router.get(
+    "/metrics",
+    response_class=Response,
+    responses={
+        status.HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ErrorResponse,
+            "description": "Metrics storage is unavailable",
+        }
+    },
+)
+async def get_metrics(
+    metrics: Annotated[MetricsStore, Depends(get_metrics_store)],
+) -> Response:
+    try:
+        snapshot = await metrics.snapshot()
+    except RedisError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "metrics_unavailable",
+                "message": "Metrics are unavailable",
+            },
+        ) from error
+
+    return Response(
+        content=render_prometheus(snapshot),
+        media_type="text/plain; version=0.0.4",
+    )
 
 
 @router.get(

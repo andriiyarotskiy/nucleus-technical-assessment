@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     redis_consumer_group: str = "transaction-processors"
     redis_consumer_name: str | None = None
     redis_dead_letter_stream: str = "transactions:dead-letter"
+    redis_metrics_key: str = "transaction-service:metrics"
     redis_batch_size: int = Field(default=10, ge=1, le=100)
     redis_block_ms: int = Field(default=5_000, ge=1)
     worker_retry_delay_ms: int = Field(default=5_000, ge=1)
