@@ -41,7 +41,7 @@ async def test_unknown_currency_raises_domain_error(
         await converter.convert_to_usd(Decimal("100"), "JPY")
 
 
-async def test_rate_provider_failure_is_preserved_for_worker_retry() -> None:
+async def test_rate_provider_failure_stays_retryable() -> None:
     converter = CurrencyConverter(UnavailableRateProvider())
 
     with pytest.raises(
