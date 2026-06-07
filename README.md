@@ -1,9 +1,9 @@
 # Transaction Event Service
 
 Python foundation for the asynchronous transaction processing service described
-in [docs/architecture.md](docs/architecture.md). The database layer and currency
-conversion service are implemented; API endpoints and queue consumption are not
-implemented yet.
+in [docs/architecture.md](docs/architecture.md). The database layer, currency
+conversion service, and event ingestion endpoint are implemented; queue
+consumption is not implemented yet.
 
 ## Prerequisites
 
@@ -47,14 +47,32 @@ GBP `1.27`. Conversion uses `Decimal` and rounds USD to two decimal places with
 `ROUND_HALF_UP`. The converter depends on an async rate-provider protocol so a
 future external provider can report temporary failures for worker retries.
 
+## Event Ingestion
+
+`POST /events` validates a transaction event and appends a versioned JSON payload
+to the Redis Stream named `transactions`. It returns `202 Accepted` only after
+Redis confirms `XADD`, and returns `503 Service Unavailable` when publishing
+fails. The endpoint does not write to PostgreSQL.
+
+```bash
+curl -X POST http://localhost:8000/events \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "id": "11111111-1111-1111-1111-111111111111",
+    "user_id": "22222222-2222-2222-2222-222222222222",
+    "amount": "100.25",
+    "currency": "EUR",
+    "timestamp": "2026-06-07T12:00:00Z"
+  }'
+```
+
 ## Run
 
 ```bash
 docker compose up --build
 ```
 
-The API container listens on `http://localhost:8000`. No business routes are
-available in this scaffolding phase.
+The API container listens on `http://localhost:8000`.
 
 ## Design Notes
 

@@ -101,7 +101,7 @@ will live close to the use case that owns the transaction.
 
 ## API Design
 
-### `POST /transactions`
+### `POST /events`
 
 - Validates all fields before enqueueing.
 - Returns `202 Accepted` after Redis confirms `XADD`.

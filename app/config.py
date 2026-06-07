@@ -17,6 +17,7 @@ class Settings(BaseSettings):
         "postgresql+asyncpg://postgres:postgres@localhost:5432/transactions"
     )
     redis_url: str = "redis://localhost:6379/0"
+    redis_stream_name: str = "transactions"
 
 
 @lru_cache

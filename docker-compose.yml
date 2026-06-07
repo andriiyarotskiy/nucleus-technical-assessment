@@ -6,6 +6,7 @@ services:
       APP_LOG_LEVEL: INFO
       APP_POSTGRES_DSN: postgresql+asyncpg://postgres:postgres@postgres:5432/transactions
       APP_REDIS_URL: redis://redis:6379/0
+      APP_REDIS_STREAM_NAME: transactions
     ports:
       - "8000:8000"
     depends_on:
@@ -22,6 +23,7 @@ services:
       APP_LOG_LEVEL: INFO
       APP_POSTGRES_DSN: postgresql+asyncpg://postgres:postgres@postgres:5432/transactions
       APP_REDIS_URL: redis://redis:6379/0
+      APP_REDIS_STREAM_NAME: transactions
     depends_on:
       postgres:
         condition: service_healthy
@@ -44,6 +46,8 @@ services:
 
   redis:
     image: redis:7.4-alpine
+    ports:
+      - "6379:6379"
     command: [ "redis-server", "--appendonly", "yes" ]
     healthcheck:
       test: [ "CMD", "redis-cli", "ping" ]
