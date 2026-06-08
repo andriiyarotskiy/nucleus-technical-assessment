@@ -34,6 +34,14 @@ async def test_converts_eur_to_usd(converter: CurrencyConverter) -> None:
     assert result.usd_rate == Decimal("1.08")
 
 
+async def test_rounds_half_up_to_two_decimal_places(
+    converter: CurrencyConverter,
+) -> None:
+    result = await converter.convert_to_usd(Decimal("10.005"), "USD")
+
+    assert result.amount_usd == Decimal("10.01")
+
+
 async def test_unknown_currency_raises_domain_error(
     converter: CurrencyConverter,
 ) -> None:

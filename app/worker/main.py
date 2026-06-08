@@ -32,7 +32,8 @@ async def run_worker(settings: Settings) -> None:
         dead_letter_stream=settings.redis_dead_letter_stream,
         batch_size=settings.redis_batch_size,
         block_ms=settings.redis_block_ms,
-        retry_delay_ms=settings.worker_retry_delay_ms,
+        retry_base_delay_ms=settings.worker_retry_base_delay_ms,
+        retry_max_delay_ms=settings.worker_retry_max_delay_ms,
     )
 
     try:

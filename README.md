@@ -50,8 +50,9 @@ Requires Python 3.12 and [uv](https://docs.astral.sh/uv/):
 uv sync
 uv run pytest
 uv run ruff check .
-uv run ruff format .
+uv run ruff format --check .
 uv run mypy app
+docker compose config
 docker compose up --build
 ```
 
@@ -60,6 +61,26 @@ docker compose up --build
 Redis Streams provides consumer groups, acknowledgements, and pending-message
 recovery while keeping the local stack small. It supports the required
 at-least-once delivery model without introducing a separate message broker.
+
+## Delivery And Retry
+
+- `POST /events` returns `202 Accepted` only after `XADD` succeeds.
+- The worker persists the transaction first and sends `XACK` only after a
+  successful database write or a confirmed duplicate no-op.
+- Retryable failures such as PostgreSQL or rate-provider errors are left
+  unacknowledged in the consumer group's pending list.
+- The worker inspects pending entries and retries them with capped backoff:
+  `1s`, `2s`, `4s`, `8s`, then up to `30s`.
+- Invalid payloads and unsupported currencies are written to the dead-letter
+  stream and only then acknowledged.
+
+## Idempotency And Deduplication
+
+- The event `id` is the PostgreSQL primary key for `transactions`.
+- The worker uses `INSERT ... ON CONFLICT DO NOTHING`, so duplicate delivery
+  does not create duplicate rows.
+- This is an at-least-once system: the same message can be processed more than
+  once, but persisted transactions remain idempotent by event ID.
 
 ## Trade-off
 

@@ -1,5 +1,8 @@
 import asyncio
 import logging
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Protocol, TypedDict, cast
 
 from pydantic import ValidationError
 from redis.asyncio import Redis
@@ -21,10 +24,79 @@ StreamFields = dict[str, str]
 StreamMessage = tuple[str, StreamFields]
 
 
+class PendingEntry(TypedDict):
+    message_id: str
+    consumer: str
+    time_since_delivered: int
+    times_delivered: int
+
+
+class RedisStreamClient(Protocol):
+    async def xgroup_create(
+        self,
+        name: str,
+        groupname: str,
+        id: str,
+        mkstream: bool,
+    ) -> None:
+        """Create a consumer group."""
+
+    async def xack(self, name: str, groupname: str, stream_id: str) -> int:
+        """Acknowledge one stream entry."""
+
+    async def xadd(self, name: str, fields: dict[str, str]) -> str:
+        """Append one stream entry."""
+
+    async def xreadgroup(
+        self,
+        groupname: str,
+        consumername: str,
+        streams: dict[str, str],
+        count: int,
+        block: int,
+    ) -> list[tuple[str, list[StreamMessage]]]:
+        """Read new consumer-group messages."""
+
+    async def xpending_range(
+        self,
+        name: str,
+        groupname: str,
+        min: str,
+        max: str,
+        count: int,
+        consumername: str | None = None,
+        idle: int | None = None,
+    ) -> list[PendingEntry]:
+        """Read pending-message details."""
+
+    async def xclaim(
+        self,
+        name: str,
+        groupname: str,
+        consumername: str,
+        min_idle_time: int,
+        message_ids: tuple[str, ...],
+    ) -> list[StreamMessage]:
+        """Claim pending entries for a consumer."""
+
+
+@dataclass(slots=True)
+class RetryPolicy:
+    base_delay_ms: int
+    max_delay_ms: int
+
+    def delay_for_attempt(self, attempt: int) -> int:
+        exponent: int = max(attempt - 1, 0)
+        delay_ms: int = self.base_delay_ms * (2**exponent)
+        if delay_ms > self.max_delay_ms:
+            return self.max_delay_ms
+        return delay_ms
+
+
 class RedisStreamWorker:
     def __init__(
         self,
-        redis: Redis,
+        redis: Redis | RedisStreamClient,
         processor: EventProcessor,
         metrics: MetricsStore,
         stream_name: str,
@@ -33,9 +105,10 @@ class RedisStreamWorker:
         dead_letter_stream: str,
         batch_size: int,
         block_ms: int,
-        retry_delay_ms: int,
+        retry_base_delay_ms: int,
+        retry_max_delay_ms: int,
     ) -> None:
-        self._redis = redis
+        self._redis = cast(RedisStreamClient, redis)
         self._processor = processor
         self._metrics = metrics
         self._stream_name = stream_name
@@ -44,8 +117,11 @@ class RedisStreamWorker:
         self._dead_letter_stream = dead_letter_stream
         self._batch_size = batch_size
         self._block_ms = block_ms
-        self._retry_delay_ms = retry_delay_ms
-        self._claim_cursor = "0-0"
+        self._retry_policy = RetryPolicy(
+            base_delay_ms=retry_base_delay_ms,
+            max_delay_ms=retry_max_delay_ms,
+        )
+        self._retry_attempts: dict[str, int] = {}
 
     async def ensure_consumer_group(self) -> None:
         try:
@@ -85,10 +161,12 @@ class RedisStreamWorker:
             await self._dead_letter(stream_id, payload, "unsupported_currency")
             return
         except Exception:
+            self._mark_retry(stream_id)
             logger.exception("transaction_processing_failed stream_id=%s", stream_id)
             await self._record_metric(EVENTS_FAILED)
             return
 
+        self._clear_retry(stream_id)
         try:
             await self._redis.xack(self._stream_name, self._group_name, stream_id)
         except RedisError:
@@ -148,12 +226,23 @@ class RedisStreamWorker:
             )
             return
 
+        self._clear_retry(stream_id)
         logger.error(
             "transaction_dead_lettered stream_id=%s reason=%s stream=%s",
             stream_id,
             reason,
             self._dead_letter_stream,
         )
+
+    def _mark_retry(self, stream_id: str) -> None:
+        self._retry_attempts[stream_id] = self._retry_attempts.get(stream_id, 0) + 1
+
+    def _clear_retry(self, stream_id: str) -> None:
+        self._retry_attempts.pop(stream_id, None)
+
+    def _required_retry_delay_ms(self, stream_id: str) -> int:
+        attempt = self._retry_attempts.get(stream_id, 1)
+        return self._retry_policy.delay_for_attempt(attempt)
 
     async def read_new_once(self) -> int:
         response = await self._redis.xreadgroup(
@@ -166,18 +255,39 @@ class RedisStreamWorker:
         return await self._process_messages(response)
 
     async def recover_pending_once(self) -> int:
-        response = await self._redis.xautoclaim(
+        pending_entries = await self._redis.xpending_range(
             self._stream_name,
             self._group_name,
-            self._consumer_name,
-            min_idle_time=self._retry_delay_ms,
-            start_id=self._claim_cursor,
-            count=self._batch_size,
+            min="-",
+            max="+",
+            count=self._batch_size * 10,
+            idle=self._retry_policy.base_delay_ms,
         )
-        self._claim_cursor = response[0]
-        return await self._process_messages(
-            [(self._stream_name, response[1])],
-        )
+        due_entry_ids_by_delay: dict[int, list[str]] = defaultdict(list)
+        due_count = 0
+        for entry in pending_entries:
+            stream_id = entry["message_id"]
+            required_delay_ms = self._required_retry_delay_ms(stream_id)
+            if entry["time_since_delivered"] < required_delay_ms:
+                continue
+            due_entry_ids_by_delay[required_delay_ms].append(stream_id)
+            due_count += 1
+            if due_count >= self._batch_size:
+                break
+
+        processed_count = 0
+        for required_delay_ms, stream_ids in sorted(due_entry_ids_by_delay.items()):
+            claimed_messages = await self._redis.xclaim(
+                self._stream_name,
+                self._group_name,
+                self._consumer_name,
+                min_idle_time=required_delay_ms,
+                message_ids=tuple(stream_ids),
+            )
+            processed_count += await self._process_messages(
+                [(self._stream_name, claimed_messages)],
+            )
+        return processed_count
 
     async def _process_messages(
         self,
@@ -205,4 +315,4 @@ class RedisStreamWorker:
                     await self.read_new_once()
             except RedisError:
                 logger.exception("worker_redis_unavailable")
-                await asyncio.sleep(self._retry_delay_ms / 1_000)
+                await asyncio.sleep(self._retry_policy.base_delay_ms / 1_000)

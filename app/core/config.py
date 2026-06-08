@@ -26,7 +26,8 @@ class Settings(BaseSettings):
     redis_metrics_key: str = "transaction-service:metrics"
     redis_batch_size: int = Field(default=10, ge=1, le=100)
     redis_block_ms: int = Field(default=5_000, ge=1)
-    worker_retry_delay_ms: int = Field(default=5_000, ge=1)
+    worker_retry_base_delay_ms: int = Field(default=1_000, ge=1)
+    worker_retry_max_delay_ms: int = Field(default=30_000, ge=1)
 
 
 @lru_cache

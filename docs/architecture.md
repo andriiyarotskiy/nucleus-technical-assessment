@@ -1,4 +1,4 @@
-# Transaction Event Service Architecture
+# Transaction Event Service Architecture And Implementation Plan
 
 ## 1. Executive Summary
 
@@ -13,7 +13,7 @@ amounts to USD, and stores idempotent transaction records in PostgreSQL.
 | Delivery | At-least-once |
 | Deduplication | PostgreSQL primary key on event `id` |
 | Money | `Decimal`, rounded with `ROUND_HALF_UP` |
-| Retry | Unacknowledged pending entries reclaimed with `XAUTOCLAIM` |
+| Retry | Unacknowledged pending entries reclaimed with `XPENDING` and `XCLAIM`, with a simple capped backoff |
 | Deployment | API, worker, PostgreSQL, Redis, and migrations in Docker Compose |
 
 The design targets approximately 100 events/second with short bursts near 1,000.
@@ -35,7 +35,7 @@ Client --> FastAPI API --> Redis Stream --> Worker --> PostgreSQL
 Redis consumer group:
   new entries     -> XREADGROUP
   failed entries  -> pending entries list
-  recovery        -> XAUTOCLAIM
+  recovery        -> XPENDING + XCLAIM
   success         -> XACK after DB commit
   invalid events  -> dead-letter stream, then XACK
 ```
@@ -64,6 +64,7 @@ Package responsibilities:
 | Fixed in-memory rates | Deterministic, offline, no API key | Rates are not current or historical |
 | Redis-backed counters | Shared by separate API and worker processes | Best-effort metrics depend on Redis |
 | Focused repository | Keeps SQLAlchemy and transaction boundaries in `db` | One concrete repository, not a generic persistence framework |
+| Simple capped backoff | Meets the retry requirement without adding retry tables or schedulers | Retries are less adaptive than a persisted per-message schedule |
 
 ## 4. Data Flow
 
@@ -157,13 +158,44 @@ transactional boundary or distributed transaction across Redis and PostgreSQL.
 
 - Retryable failures are **not acknowledged**.
 - Failed entries remain in the consumer group's pending entries list.
-- Before reading new entries, the worker calls `XAUTOCLAIM`.
-- Entries idle for five seconds are processed through the same idempotent path.
-- The claim cursor is retained so recovery can scan the pending list.
-- Redis connection failures pause the worker for the same configured delay.
+- Before reading new entries, the worker inspects pending entries with
+  `XPENDING` and reclaims due messages with `XCLAIM`.
+- Each retryable failure increases an in-memory delay for that stream entry:
+  1 second, 2 seconds, 4 seconds, 8 seconds, and then capped at a small maximum
+  such as 30 seconds.
+- The worker re-processes a pending entry only after its idle time exceeds the
+  current backoff delay for that entry.
+- A successful commit followed by `XACK` clears the entry's retry state.
+- Redis connection failures pause the worker and then retry the loop with the
+  same capped backoff progression.
 
-The current policy is a fixed delay with unlimited attempts. This avoids a retry
-table, scheduler, and attempt metadata in a small assessment.
+Chosen approach:
+
+- Keep backoff state in worker memory, keyed by Redis Stream entry ID.
+- Use Redis pending idle time as the gate for when an entry becomes eligible for
+  another attempt.
+- Reset state on success, duplicate confirmation, or dead-letter handling.
+
+Why this approach:
+
+- It satisfies "retry with backoff" explicitly.
+- It keeps all retry behavior close to the worker instead of spreading it
+  across Redis metadata, PostgreSQL tables, or background schedulers.
+- It is easy to explain line by line in an interview.
+
+Alternatives considered:
+
+- Fixed delay only: rejected because it does not satisfy the assignment.
+- Persist retry counters in PostgreSQL or Redis: rejected because it adds state
+  management that is unnecessary for this scope.
+- Full exponential backoff with jitter and max-attempt dead-lettering: rejected
+  for now because it adds more moving parts than the assignment needs.
+
+Accepted trade-off:
+
+- Retry counters reset on worker restart because the backoff state is
+  intentionally in memory. The message is still safe because it remains pending
+  in Redis and will be retried under the at-least-once model.
 
 Terminal failures:
 
@@ -180,8 +212,8 @@ Terminal failures:
 | API crashes after `XADD` | Client may retry; DB deduplication is safe |
 | Worker crashes before commit | Entry remains pending and is reclaimed |
 | Worker crashes after commit, before `XACK` | Redelivery becomes a duplicate no-op |
-| PostgreSQL unavailable | No ACK; retry from pending list |
-| Temporary rate lookup failure | No ACK; retry from pending list |
+| PostgreSQL unavailable | No ACK; retry from pending list with backoff |
+| Temporary rate lookup failure | No ACK; retry from pending list with backoff |
 | Unsupported currency or invalid payload | Append to DLQ, then ACK original |
 | DLQ append fails | Original remains pending |
 | Concurrent duplicate IDs | Primary key selects one stored row |
@@ -191,14 +223,19 @@ Terminal failures:
 
 ## 9. Testing Strategy
 
-Current assignment-focused unit tests cover:
+Required focused tests:
 
 - `100 USD -> 100.00 USD`.
 - `100 EUR -> 108.00 USD`.
+- Explicit rounding behavior for fractional cents.
 - Unsupported currency error.
 - Retryable rate-provider failure propagation.
 - Existing event ID skips conversion and insert.
 - Database conflict determines the final duplicate outcome.
+- Worker does not `XACK` when processing fails.
+- Worker `XACK`s only after successful persistence.
+- Pending entries are recovered and retried after their backoff delay.
+- Retry delay grows on repeated retryable failures and resets after success.
 
 Verification commands:
 
@@ -210,17 +247,27 @@ uv run mypy app
 docker compose config
 ```
 
-Deliberate gap: real Redis pending-entry recovery and PostgreSQL concurrency are
-not integration-tested in this take-home. Production confidence would require
-disposable Redis/PostgreSQL integration tests for ACK timing, rollback,
-`XAUTOCLAIM`, and concurrent inserts.
+Practical scope for this assessment:
+
+- Use unit tests with fakes for worker retry, ACK timing, and recovery control
+  flow.
+- Keep PostgreSQL and Redis integration verification in command-level checks and
+  local Docker execution.
+
+Accepted remaining gap:
+
+- Full end-to-end outage recovery with real Redis pending-entry state and real
+  PostgreSQL concurrency is still heavier than needed for this take-home.
+  Production confidence would add disposable integration tests for rollback,
+  pending recovery, and concurrent inserts.
 
 ## 10. Trade-Offs
 
 ### Simplicity accepted
 
 - Fixed rates instead of an external rate API.
-- Fixed-delay, unlimited retries instead of exponential backoff and max attempts.
+- In-memory capped backoff instead of persisted retry schedules or richer retry
+  orchestration.
 - Offset pagination instead of cursor pagination.
 - Query-time summaries instead of a maintained summary table.
 - Best-effort Redis counters instead of a dedicated metrics stack.
